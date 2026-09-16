@@ -10,7 +10,6 @@ from typing import Optional
 from pymodbus.server import ModbusTcpServer
 from pymodbus.simulator import DataType, SimData, SimDevice
 
-
 # ============================================================
 # APPLICATION CONFIGURATION
 # ============================================================
