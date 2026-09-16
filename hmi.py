@@ -4,7 +4,6 @@ from pymodbus.client import ModbusTcpClient
 from datetime import datetime
 from collections import deque
 
-
 PLC_IP = "127.0.0.1"
 PLC_PORT = 5020
 UNIT_ID = 1
