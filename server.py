@@ -1,12 +1,4 @@
 """
-Professional Modbus TCP PLC Simulator
-=====================================
-
-PyModbus : 3.13.1
-Protocol : Modbus TCP
-Device ID: 1
-Default  : 127.0.0.1:5020
-
 Architecture:
 
     Modbus TCP Server
