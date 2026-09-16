@@ -951,39 +951,8 @@ class PLCSimulator:
         self,
         commands: dict,
     ) -> None:
+        pass
 
-        self.logger.info(
-            "MOTOR=%s | "
-            "MODE=%s | "
-            "SET_RPM=%d | "
-            "RPM=%d | "
-            "CURRENT=%.1f A | "
-            "SET_PRESSURE=%.1f bar | "
-            "PRESSURE=%.1f bar | "
-            "TEMP=%.1f C | "
-            "ALARM=%s | "
-            "FAULT=%s | "
-            "HB=%d",
-            (
-                "ON"
-                if commands["motor_command"]
-                else "OFF"
-            ),
-            (
-                "AUTO"
-                if commands["mode"]
-                else "MANUAL"
-            ),
-            commands["speed_setpoint"],
-            self.state.actual_rpm,
-            self.state.current_a,
-            commands["pressure_setpoint"],
-            self.state.pressure_bar,
-            self.state.temperature_c,
-            self.state.alarm,
-            self.state.fault_code.name,
-            self.state.heartbeat,
-        )
 
     # ========================================================
     # MAIN PLC LOOP
