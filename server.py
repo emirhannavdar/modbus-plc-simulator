@@ -1,18 +1,18 @@
 """
-Architecture:
-    Modbus TCP Server
-          |
-          v
-    SimDevice / SimData
-          |
-          v
-    Register Database
-          |
-          v
-    PLC Control Logic
-          |
-          v
-    Process Simulation
+0	40001	MOTOR_COMMAND	Motor calistir/durdur komutu	0=STOP, 1=START
+1	40002	MODE	calisma modu	0=MANUAL, 1=AUTO
+2-3	40003-40004	SPEED_SETPOINT	Motor hedef devri	UINT32, RPM
+4-5	40005-40006	ACTUAL_RPM	Gerçek motor devri	UINT32, RPM
+6-7	40007-40008	CURRENT	Motor akimi	UINT32,
+8-9	40009-40010	PRESSURE_SETPOINT	Hedef basinc	UINT32, 
+10-11	40011-40012	ACTUAL_PRESSURE	Gerçek basinc	UINT32, 
+12-13	40013-40014	TEMPERATURE	Motor/sistem sicakliği	UINT32,
+14	40015	ALARM	Alarm durumu	0=Normal, 1=Alarm
+15	40016	EMERGENCY_STOP	Acil durdurma	0=Serbest, 1=Aktif
+16	40017	HEARTBEAT	PLC yaşam sinyali	UINT16, sürekli artar
+17	40018	STATUS_WORD	PLC/motor durum bitleri	UINT16, bit field
+18	40019	FAULT_CODE	Hata kodu	UINT16
+19-20	40020-40021	RUNTIME_SECONDS	Motor calisma süresi
 """
 
 from __future__ import annotations
