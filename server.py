@@ -1,6 +1,5 @@
 """
 Architecture:
-
     Modbus TCP Server
           |
           v
