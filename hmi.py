@@ -1,81 +1,53 @@
-"""
-Professional Modbus TCP PLC HMI
-================================
-
-Compatible with:
-    PyModbus 3.x
-    Python 3.x
-
-Connects to:
-    127.0.0.1:5020
-    Unit ID: 1
-
-This HMI does NOT modify server.py.
-It communicates with the PLC simulator only through Modbus TCP.
-"""
-
-from __future__ import annotations
-
 import tkinter as tk
 from tkinter import ttk, messagebox
-
 from pymodbus.client import ModbusTcpClient
+from datetime import datetime
+import threading
+from collections import deque
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
 PLC_IP = "127.0.0.1"
 PLC_PORT = 5020
 UNIT_ID = 1
-
-REFRESH_MS = 500
+POLL_INTERVAL_MS = 500
+MAX_RPM = 3000
+MAX_PRESSURE = 10.0
+MAX_TEMPERATURE = 100.0
+MAX_CURRENT = 30.0
+TREND_POINTS = 120
 
 
 # ============================================================
 # REGISTER MAP
 # ============================================================
 
-MOTOR_COMMAND = 0
-MODE = 1
-
-SPEED_SETPOINT_HI = 2
-SPEED_SETPOINT_LO = 3
-
-ACTUAL_RPM_HI = 4
-ACTUAL_RPM_LO = 5
-
-CURRENT_HI = 6
-CURRENT_LO = 7
-
-PRESSURE_SETPOINT_HI = 8
-PRESSURE_SETPOINT_LO = 9
-
-ACTUAL_PRESSURE_HI = 10
-ACTUAL_PRESSURE_LO = 11
-
-TEMPERATURE_HI = 12
-TEMPERATURE_LO = 13
-
-ALARM = 14
-EMERGENCY_STOP = 15
-
-HEARTBEAT = 16
-STATUS_WORD = 17
-FAULT_CODE = 18
-
-RUNTIME_SECONDS_HI = 19
-RUNTIME_SECONDS_LO = 20
-
-REGISTER_COUNT = 21
+REG = {
+    "MOTOR_COMMAND": 0,
+    "MODE": 1,
+    "SPEED_SETPOINT": 2,
+    "ACTUAL_RPM": 4,
+    "CURRENT": 6,
+    "PRESSURE_SETPOINT": 8,
+    "ACTUAL_PRESSURE": 10,
+    "TEMPERATURE": 12,
+    "ALARM": 14,
+    "EMERGENCY_STOP": 15,
+    "HEARTBEAT": 16,
+    "STATUS_WORD": 17,
+    "FAULT_CODE": 18,
+    "RUNTIME": 19,
+}
 
 
 # ============================================================
-# FAULT NAMES
+# FAULTS
 # ============================================================
 
-FAULT_NAMES = {
+FAULT_CODES = {
     0: "NONE",
     1: "EMERGENCY STOP",
     2: "OVER TEMPERATURE",
@@ -86,39 +58,6 @@ FAULT_NAMES = {
     7: "INVALID SETPOINT",
 }
 
-
-# ============================================================
-# REGISTER NAMES
-# ============================================================
-
-REGISTER_NAMES = {
-    0: "MOTOR_COMMAND",
-    1: "MODE",
-    2: "SPEED_SETPOINT_HI",
-    3: "SPEED_SETPOINT_LO",
-    4: "ACTUAL_RPM_HI",
-    5: "ACTUAL_RPM_LO",
-    6: "CURRENT_HI",
-    7: "CURRENT_LO",
-    8: "PRESSURE_SETPOINT_HI",
-    9: "PRESSURE_SETPOINT_LO",
-    10: "ACTUAL_PRESSURE_HI",
-    11: "ACTUAL_PRESSURE_LO",
-    12: "TEMPERATURE_HI",
-    13: "TEMPERATURE_LO",
-    14: "ALARM",
-    15: "EMERGENCY_STOP",
-    16: "HEARTBEAT",
-    17: "STATUS_WORD",
-    18: "FAULT_CODE",
-    19: "RUNTIME_SECONDS_HI",
-    20: "RUNTIME_SECONDS_LO",
-}
-
-
-# ============================================================
-# STATUS WORD
-# ============================================================
 
 STATUS_BITS = [
     (0, "STOPPED"),
@@ -133,1591 +72,2039 @@ STATUS_BITS = [
 
 
 # ============================================================
-# HELPERS
+# COLORS
 # ============================================================
 
-def uint32_from_registers(
-    high: int,
-    low: int,
-) -> int:
+BG = "#0b1120"
+PANEL = "#111827"
+PANEL_2 = "#172033"
+BORDER = "#263247"
+TEXT = "#f1f5f9"
+MUTED = "#94a3b8"
 
-    return (
-        (high << 16)
-        | low
-    )
+GREEN = "#22c55e"
+GREEN_DARK = "#14532d"
 
+BLUE = "#38bdf8"
+BLUE_DARK = "#0c4a6e"
 
-def safe_register(
-    registers: list[int],
-    index: int,
-) -> int:
+AMBER = "#f59e0b"
+AMBER_DARK = "#78350f"
 
-    if 0 <= index < len(registers):
-        return registers[index]
-
-    return 0
+RED = "#ef4444"
+RED_DARK = "#7f1d1d"
 
 
 # ============================================================
-# HMI
+# MODBUS MANAGER
 # ============================================================
 
-class PLC_HMI:
+class ModbusManager:
 
-    def __init__(
-        self,
-        root: tk.Tk,
-    ) -> None:
+    def __init__(self):
+
+        self.client = None
+        self.lock = threading.Lock()
+        self.connected = False
+
+    def connect(self):
+
+        with self.lock:
+
+            try:
+
+                if self.client is not None:
+
+                    try:
+                        self.client.close()
+                    except Exception:
+                        pass
+
+                self.client = ModbusTcpClient(
+                    host=PLC_IP,
+                    port=PLC_PORT,
+                    timeout=2
+                )
+
+                print(
+                    f"[MODBUS] Connecting to "
+                    f"{PLC_IP}:{PLC_PORT}"
+                )
+
+                result = self.client.connect()
+
+                self.connected = bool(result)
+
+                if self.connected:
+
+                    print(
+                        f"[MODBUS] Connected to "
+                        f"{PLC_IP}:{PLC_PORT}"
+                    )
+
+                else:
+
+                    print(
+                        "[MODBUS] Connection FAILED"
+                    )
+
+                return self.connected
+
+            except Exception as exc:
+
+                print(
+                    f"[MODBUS] Connection ERROR: {exc}"
+                )
+
+                self.connected = False
+
+                return False
+
+    def ensure_connection(self):
+
+        if self.connected and self.client is not None:
+            return True
+
+        return self.connect()
+
+    def disconnect(self):
+
+        with self.lock:
+
+            try:
+
+                if self.client:
+                    self.client.close()
+
+            except Exception:
+                pass
+
+            self.client = None
+            self.connected = False
+
+    def read_registers(self):
+
+        with self.lock:
+
+            if not self.connected:
+                return None
+
+            if self.client is None:
+                return None
+
+            try:
+
+                result = self.client.read_holding_registers(
+                    address=0,
+                    count=21,
+                    device_id=UNIT_ID
+                )
+
+                if result.isError():
+
+                    print(
+                        f"[MODBUS] Read error: {result}"
+                    )
+
+                    self.connected = False
+
+                    return None
+
+                return result.registers
+
+            except Exception as exc:
+
+                print(
+                    f"[MODBUS] Read exception: {exc}"
+                )
+
+                self.connected = False
+
+                return None
+
+    def write_register(self, address, value):
+
+        if not self.ensure_connection():
+            return False
+
+        with self.lock:
+
+            try:
+
+                result = self.client.write_register(
+                    address=address,
+                    value=int(value),
+                    device_id=UNIT_ID
+                )
+
+                if result.isError():
+
+                    print(
+                        f"[MODBUS] Write error: {result}"
+                    )
+
+                    self.connected = False
+
+                    return False
+
+                print(
+                    f"[MODBUS] WRITE "
+                    f"400{address + 1:02d} = {value}"
+                )
+
+                return True
+
+            except Exception as exc:
+
+                print(
+                    f"[MODBUS] Write exception: {exc}"
+                )
+
+                self.connected = False
+
+                return False
+
+    def write_uint32(self, address, value):
+
+        # ----------------------------------------------------
+        # FIX:
+        # Make sure the connection exists before writing.
+        # ----------------------------------------------------
+
+        if not self.ensure_connection():
+            return False
+
+        with self.lock:
+
+            try:
+
+                value = int(value)
+
+                if value < 0 or value > 0xFFFFFFFF:
+
+                    print(
+                        f"[MODBUS] Invalid UINT32 value: {value}"
+                    )
+
+                    return False
+
+                high = (value >> 16) & 0xFFFF
+                low = value & 0xFFFF
+
+                result = self.client.write_registers(
+                    address=address,
+                    values=[high, low],
+                    device_id=UNIT_ID
+                )
+
+                if result.isError():
+
+                    print(
+                        f"[MODBUS] Write UINT32 error "
+                        f"at {address}: {result}"
+                    )
+
+                    self.connected = False
+
+                    return False
+
+                print(
+                    f"[MODBUS] WRITE UINT32 | "
+                    f"Address={address} | "
+                    f"Value={value} | "
+                    f"Registers=[{high}, {low}]"
+                )
+
+                return True
+
+            except Exception as e:
+
+                print(
+                    f"[MODBUS] Write UINT32 exception: {e}"
+                )
+
+                self.connected = False
+
+                return False
+
+
+# ============================================================
+# MAIN HMI
+# ============================================================
+
+class PLCMonitor:
+
+    def __init__(self, root):
 
         self.root = root
 
         self.root.title(
-            "Professional Modbus PLC - HMI"
+            "Smart PLC Control Center"
         )
 
         self.root.geometry(
-            "1100x850"
+            "1450x900"
         )
 
         self.root.minsize(
-            850,
-            650
+            1200,
+            760
         )
 
         self.root.configure(
-            bg="#0d1117"
+            bg=BG
         )
 
-        self.client = ModbusTcpClient(
-            PLC_IP,
-            port=PLC_PORT,
-            timeout=1,
+        self.modbus = ModbusManager()
+
+        self.running = True
+
+        self.last_data = None
+
+        self.rpm_history = deque(
+            maxlen=TREND_POINTS
         )
 
-        self.connected = False
+        self.pressure_history = deque(
+            maxlen=TREND_POINTS
+        )
 
-        self.create_styles()
-        self.create_variables()
-        self.create_ui()
+        self.temperature_history = deque(
+            maxlen=TREND_POINTS
+        )
+
+        self.setup_style()
+
+        self.build_interface()
 
         self.root.protocol(
             "WM_DELETE_WINDOW",
-            self.on_close,
+            self.close
         )
 
-        self.update_connection()
+        self.start_connection()
 
     # ========================================================
-    # STYLES
+    # STYLE
     # ========================================================
 
-    def create_styles(self) -> None:
+    def setup_style(self):
 
         style = ttk.Style()
 
         try:
             style.theme_use("clam")
-        except tk.TclError:
+        except Exception:
             pass
 
         style.configure(
-            "TFrame",
-            background="#0d1117",
+            "TNotebook",
+            background=BG,
+            borderwidth=0
         )
 
         style.configure(
-            "Card.TFrame",
-            background="#161b22",
+            "TNotebook.Tab",
+            background=PANEL,
+            foreground=MUTED,
+            padding=(18, 10),
+            font=("Segoe UI", 10, "bold")
         )
 
-        style.configure(
-            "TLabel",
-            background="#0d1117",
-            foreground="#e6edf3",
-            font=("Segoe UI", 10),
-        )
-
-        style.configure(
-            "Card.TLabel",
-            background="#161b22",
-            foreground="#e6edf3",
-            font=("Segoe UI", 10),
-        )
-
-        style.configure(
-            "Title.TLabel",
-            background="#0d1117",
-            foreground="#ffffff",
-            font=("Segoe UI", 21, "bold"),
-        )
-
-        style.configure(
-            "Subtitle.TLabel",
-            background="#0d1117",
-            foreground="#8b949e",
-            font=("Segoe UI", 10),
-        )
-
-        style.configure(
-            "CardTitle.TLabel",
-            background="#161b22",
-            foreground="#8b949e",
-            font=("Segoe UI", 9, "bold"),
-        )
-
-        style.configure(
-            "Value.TLabel",
-            background="#161b22",
-            foreground="#ffffff",
-            font=("Segoe UI", 19, "bold"),
-        )
-
-        style.configure(
-            "Status.TLabel",
-            background="#161b22",
-            foreground="#58a6ff",
-            font=("Segoe UI", 13, "bold"),
-        )
-
-        style.configure(
-            "Section.TLabel",
-            background="#161b22",
-            foreground="#58a6ff",
-            font=("Segoe UI", 12, "bold"),
-        )
-
-        style.configure(
-            "TButton",
-            font=("Segoe UI", 10, "bold"),
-            padding=8,
+        style.map(
+            "TNotebook.Tab",
+            background=[
+                ("selected", PANEL_2)
+            ],
+            foreground=[
+                ("selected", TEXT)
+            ]
         )
 
         style.configure(
             "Treeview",
-            background="#0d1117",
-            foreground="#e6edf3",
-            fieldbackground="#0d1117",
-            rowheight=27,
-            font=("Consolas", 9),
+            background=PANEL,
+            foreground=TEXT,
+            fieldbackground=PANEL,
+            rowheight=30,
+            borderwidth=0,
+            font=("Consolas", 9)
         )
 
         style.configure(
             "Treeview.Heading",
-            background="#21262d",
-            foreground="#ffffff",
-            font=("Segoe UI", 9, "bold"),
-        )
-
-        style.map(
-            "Treeview",
-            background=[
-                ("selected", "#1f6feb")
-            ],
+            background=PANEL_2,
+            foreground=TEXT,
+            font=("Segoe UI", 9, "bold")
         )
 
     # ========================================================
-    # VARIABLES
+    # BUILD UI
     # ========================================================
 
-    def create_variables(self) -> None:
+    def build_interface(self):
 
-        self.connection_var = tk.StringVar(
-            value="DISCONNECTED"
+        self.build_header()
+
+        self.build_alarm_banner()
+
+        self.notebook = ttk.Notebook(
+            self.root
         )
 
-        self.motor_var = tk.StringVar(
-            value="OFF"
-        )
-
-        self.mode_var = tk.StringVar(
-            value="MANUAL"
-        )
-
-        self.rpm_var = tk.StringVar(
-            value="0 RPM"
-        )
-
-        self.speed_setpoint_var = tk.StringVar(
-            value="0 RPM"
-        )
-
-        self.current_var = tk.StringVar(
-            value="0.0 A"
-        )
-
-        self.pressure_var = tk.StringVar(
-            value="0.0 bar"
-        )
-
-        self.pressure_setpoint_var = tk.StringVar(
-            value="0.0 bar"
-        )
-
-        self.temperature_var = tk.StringVar(
-            value="25.0 °C"
-        )
-
-        self.alarm_var = tk.StringVar(
-            value="NORMAL"
-        )
-
-        self.fault_var = tk.StringVar(
-            value="NONE"
-        )
-
-        self.heartbeat_var = tk.StringVar(
-            value="0"
-        )
-
-        self.runtime_var = tk.StringVar(
-            value="0 s"
-        )
-
-        self.status_word_var = tk.StringVar(
-            value="0x0000"
-        )
-
-        self.estop_var = tk.StringVar(
-            value="RELEASED"
-        )
-
-        self.ready_var = tk.StringVar(
-            value="NOT READY"
-        )
-
-        self.rpm_entry_var = tk.StringVar(
-            value="1000"
-        )
-
-        self.pressure_entry_var = tk.StringVar(
-            value="5.0"
-        )
-
-        self.connection_detail_var = tk.StringVar(
-            value="127.0.0.1:5020"
-        )
-
-        self.register_count_var = tk.StringVar(
-            value="21"
-        )
-
-        self.status_bit_vars = {}
-
-    # ========================================================
-    # SCROLLABLE UI
-    # ========================================================
-
-    def create_ui(self) -> None:
-
-        container = tk.Frame(
-            self.root,
-            bg="#0d1117",
-        )
-
-        container.pack(
+        self.notebook.pack(
             fill="both",
-            expand=True,
+            expand=True
         )
 
-        canvas = tk.Canvas(
-            container,
-            bg="#0d1117",
-            highlightthickness=0,
-            bd=0,
+        self.overview_tab = tk.Frame(
+            self.notebook,
+            bg=BG
         )
 
-        scrollbar = ttk.Scrollbar(
-            container,
-            orient="vertical",
-            command=canvas.yview,
+        self.trend_tab = tk.Frame(
+            self.notebook,
+            bg=BG
         )
 
-        canvas.configure(
-            yscrollcommand=scrollbar.set,
+        self.register_tab = tk.Frame(
+            self.notebook,
+            bg=BG
         )
 
-        scrollbar.pack(
-            side="right",
-            fill="y",
+        self.diagnostics_tab = tk.Frame(
+            self.notebook,
+            bg=BG
         )
 
-        canvas.pack(
-            side="left",
-            fill="both",
-            expand=True,
+        self.notebook.add(
+            self.overview_tab,
+            text="  OVERVIEW  "
         )
 
-        content = tk.Frame(
-            canvas,
-            bg="#0d1117",
+        self.notebook.add(
+            self.trend_tab,
+            text="  TRENDS  "
         )
 
-        canvas_window = canvas.create_window(
-            (0, 0),
-            window=content,
-            anchor="nw",
+        self.notebook.add(
+            self.register_tab,
+            text="  REGISTERS  "
         )
 
-        def update_scroll_region(event=None):
-
-            canvas.configure(
-                scrollregion=canvas.bbox("all")
-            )
-
-        content.bind(
-            "<Configure>",
-            update_scroll_region,
+        self.notebook.add(
+            self.diagnostics_tab,
+            text="  DIAGNOSTICS  "
         )
 
-        def resize_content(event):
+        self.build_overview()
 
-            canvas.itemconfigure(
-                canvas_window,
-                width=event.width,
-            )
+        self.build_trends()
 
-        canvas.bind(
-            "<Configure>",
-            resize_content,
-        )
+        self.build_registers()
 
-        def on_mousewheel(event):
+        self.build_diagnostics()
 
-            canvas.yview_scroll(
-                int(-1 * (event.delta / 120)),
-                "units",
-            )
-
-        canvas.bind_all(
-            "<MouseWheel>",
-            on_mousewheel,
-        )
-
-        self.create_header(content)
-        self.create_process_panel(content)
-        self.create_status_panel(content)
-        self.create_control_panel(content)
-        self.create_setpoint_panel(content)
-        self.create_status_bits_panel(content)
-        self.create_register_panel(content)
+        self.build_footer()
 
     # ========================================================
     # HEADER
     # ========================================================
 
-    def create_header(
-        self,
-        parent,
-    ) -> None:
+    def build_header(self):
 
         header = tk.Frame(
-            parent,
-            bg="#0d1117",
+            self.root,
+            bg=PANEL,
+            height=72
         )
 
         header.pack(
-            fill="x",
-            padx=25,
-            pady=(20, 10),
+            fill="x"
         )
+
+        header.pack_propagate(False)
 
         left = tk.Frame(
             header,
-            bg="#0d1117",
+            bg=PANEL
         )
 
         left.pack(
             side="left",
-            fill="x",
-            expand=True,
+            padx=25
         )
 
         tk.Label(
             left,
-            text="PROFESSIONAL MODBUS PLC",
-            bg="#0d1117",
-            fg="#ffffff",
-            font=("Segoe UI", 21, "bold"),
+            text="SMART PLC",
+            bg=PANEL,
+            fg=TEXT,
+            font=("Segoe UI", 21, "bold")
         ).pack(
-            anchor="w"
+            side="left",
+            pady=16
         )
 
         tk.Label(
             left,
-            text="Industrial Motor / Pump Simulator",
-            bg="#0d1117",
-            fg="#8b949e",
-            font=("Segoe UI", 10),
+            text="  CONTROL CENTER",
+            bg=PANEL,
+            fg=BLUE,
+            font=("Segoe UI", 11, "bold")
         ).pack(
-            anchor="w"
+            side="left",
+            pady=20
         )
 
         right = tk.Frame(
             header,
-            bg="#0d1117",
+            bg=PANEL
         )
 
         right.pack(
-            side="right"
+            side="right",
+            padx=25
+        )
+
+        self.connection_dot = tk.Label(
+            right,
+            text="●",
+            bg=PANEL,
+            fg=RED,
+            font=("Segoe UI", 18)
+        )
+
+        self.connection_dot.pack(
+            side="left"
         )
 
         self.connection_label = tk.Label(
             right,
-            textvariable=self.connection_var,
-            bg="#0d1117",
-            fg="#f85149",
-            font=("Segoe UI", 11, "bold"),
+            text="DISCONNECTED",
+            bg=PANEL,
+            fg=RED,
+            font=("Segoe UI", 10, "bold")
         )
 
         self.connection_label.pack(
-            anchor="e"
+            side="left",
+            padx=8
         )
 
         tk.Label(
             right,
-            textvariable=self.connection_detail_var,
-            bg="#0d1117",
-            fg="#8b949e",
-            font=("Consolas", 9),
+            text=f"{PLC_IP}:{PLC_PORT} | UNIT {UNIT_ID}",
+            bg=PANEL,
+            fg=MUTED,
+            font=("Consolas", 9)
         ).pack(
-            anchor="e",
-            pady=(3, 0),
+            side="left"
         )
 
     # ========================================================
-    # PROCESS PANEL
+    # ALARM
     # ========================================================
 
-    def create_process_panel(
+    def build_alarm_banner(self):
+
+        self.alarm_banner = tk.Frame(
+            self.root,
+            bg=GREEN_DARK,
+            height=38
+        )
+
+        self.alarm_banner.pack(
+            fill="x"
+        )
+
+        self.alarm_banner.pack_propagate(
+            False
+        )
+
+        self.alarm_text = tk.Label(
+            self.alarm_banner,
+            text="●  SYSTEM READY — NO ACTIVE ALARMS",
+            bg=GREEN_DARK,
+            fg=TEXT,
+            font=("Segoe UI", 10, "bold")
+        )
+
+        self.alarm_text.pack(
+            side="left",
+            padx=25
+        )
+
+    # ========================================================
+    # OVERVIEW
+    # ========================================================
+
+    def build_overview(self):
+
+        container = tk.Frame(
+            self.overview_tab,
+            bg=BG
+        )
+
+        container.pack(
+            fill="both",
+            expand=True,
+            padx=10,
+            pady=10
+        )
+
+        left = tk.Frame(
+            container,
+            bg=BG
+        )
+
+        left.pack(
+            side="left",
+            fill="both",
+            expand=True
+        )
+
+        right = tk.Frame(
+            container,
+            bg=BG,
+            width=370
+        )
+
+        right.pack(
+            side="right",
+            fill="y",
+            padx=(5, 0)
+        )
+
+        right.pack_propagate(
+            False
+        )
+
+        self.build_process_panel(left)
+
+        self.build_motor_panel(left)
+
+        self.build_control_panel(right)
+
+        self.build_status_panel(right)
+
+    # ========================================================
+    # PROCESS
+    # ========================================================
+
+    def build_process_panel(self, parent):
+
+        panel = tk.Frame(
+            parent,
+            bg=PANEL,
+            highlightbackground=BORDER,
+            highlightthickness=1
+        )
+
+        panel.pack(
+            fill="both",
+            expand=True,
+            padx=5,
+            pady=5
+        )
+
+        tk.Label(
+            panel,
+            text="PROCESS OVERVIEW",
+            bg=PANEL,
+            fg=TEXT,
+            font=("Segoe UI", 11, "bold")
+        ).pack(
+            anchor="w",
+            padx=18,
+            pady=(15, 5)
+        )
+
+        frame = tk.Frame(
+            panel,
+            bg=PANEL
+        )
+
+        frame.pack(
+            fill="both",
+            expand=True,
+            padx=10
+        )
+
+        self.rpm_value = self.metric(
+            frame,
+            "ACTUAL RPM",
+            "--",
+            "RPM"
+        )
+
+        self.current_value = self.metric(
+            frame,
+            "CURRENT",
+            "--",
+            "A"
+        )
+
+        self.pressure_value = self.metric(
+            frame,
+            "PRESSURE",
+            "--",
+            "bar"
+        )
+
+        self.temperature_value = self.metric(
+            frame,
+            "TEMPERATURE",
+            "--",
+            "°C"
+        )
+
+    def metric(
         self,
         parent,
-    ) -> None:
+        title,
+        value,
+        unit
+    ):
+
+        card = tk.Frame(
+            parent,
+            bg=PANEL_2,
+            highlightbackground=BORDER,
+            highlightthickness=1
+        )
+
+        card.pack(
+            side="left",
+            fill="both",
+            expand=True,
+            padx=5,
+            pady=10
+        )
+
+        tk.Label(
+            card,
+            text=title,
+            bg=PANEL_2,
+            fg=MUTED,
+            font=("Segoe UI", 9, "bold")
+        ).pack(
+            anchor="w",
+            padx=12,
+            pady=(12, 0)
+        )
+
+        value_label = tk.Label(
+            card,
+            text=value,
+            bg=PANEL_2,
+            fg=TEXT,
+            font=("Segoe UI", 25, "bold")
+        )
+
+        value_label.pack(
+            anchor="w",
+            padx=12,
+            pady=5
+        )
+
+        tk.Label(
+            card,
+            text=unit,
+            bg=PANEL_2,
+            fg=MUTED,
+            font=("Segoe UI", 9)
+        ).pack(
+            anchor="w",
+            padx=12
+        )
+
+        return value_label
+
+    # ========================================================
+    # MOTOR PANEL
+    # ========================================================
+
+    def build_motor_panel(self, parent):
+
+        panel = tk.Frame(
+            parent,
+            bg=PANEL,
+            highlightbackground=BORDER,
+            highlightthickness=1
+        )
+
+        panel.pack(
+            fill="x",
+            padx=5,
+            pady=5
+        )
+
+        tk.Label(
+            panel,
+            text="MOTOR STATE",
+            bg=PANEL,
+            fg=MUTED,
+            font=("Segoe UI", 9, "bold")
+        ).pack(
+            anchor="w",
+            padx=18,
+            pady=(12, 0)
+        )
+
+        self.motor_state_label = tk.Label(
+            panel,
+            text="STOPPED",
+            bg=PANEL,
+            fg=GREEN,
+            font=("Segoe UI", 25, "bold")
+        )
+
+        self.motor_state_label.pack(
+            anchor="w",
+            padx=18
+        )
+
+        self.motor_progress = ttk.Progressbar(
+            panel,
+            orient="horizontal",
+            mode="determinate",
+            maximum=MAX_RPM
+        )
+
+        self.motor_progress.pack(
+            fill="x",
+            padx=18,
+            pady=(5, 15)
+        )
+
+    # ========================================================
+    # CONTROL
+    # ========================================================
+
+    def build_control_panel(self, parent):
+
+        panel = tk.Frame(
+            parent,
+            bg=PANEL,
+            highlightbackground=BORDER,
+            highlightthickness=1
+        )
+
+        panel.pack(
+            fill="x",
+            padx=5,
+            pady=5
+        )
+
+        tk.Label(
+            panel,
+            text="CONTROL",
+            bg=PANEL,
+            fg=TEXT,
+            font=("Segoe UI", 11, "bold")
+        ).pack(
+            anchor="w",
+            padx=18,
+            pady=(15, 12)
+        )
+
+        buttons = tk.Frame(
+            panel,
+            bg=PANEL
+        )
+
+        buttons.pack(
+            fill="x",
+            padx=15
+        )
+
+        tk.Button(
+            buttons,
+            text="▶  START",
+            command=lambda: self.write_register(
+                REG["MOTOR_COMMAND"],
+                1
+            ),
+            bg=GREEN_DARK,
+            fg=TEXT,
+            activebackground=GREEN,
+            relief="flat",
+            font=("Segoe UI", 10, "bold"),
+            cursor="hand2",
+            height=2
+        ).pack(
+            side="left",
+            fill="x",
+            expand=True,
+            padx=(0, 5)
+        )
+
+        tk.Button(
+            buttons,
+            text="■  STOP",
+            command=lambda: self.write_register(
+                REG["MOTOR_COMMAND"],
+                0
+            ),
+            bg="#334155",
+            fg=TEXT,
+            activebackground="#475569",
+            relief="flat",
+            font=("Segoe UI", 10, "bold"),
+            cursor="hand2",
+            height=2
+        ).pack(
+            side="left",
+            fill="x",
+            expand=True,
+            padx=(5, 0)
+        )
+
+        tk.Label(
+            panel,
+            text="OPERATING MODE",
+            bg=PANEL,
+            fg=MUTED,
+            font=("Segoe UI", 8, "bold")
+        ).pack(
+            anchor="w",
+            padx=18,
+            pady=(18, 5)
+        )
+
+        modes = tk.Frame(
+            panel,
+            bg=PANEL
+        )
+
+        modes.pack(
+            fill="x",
+            padx=15
+        )
+
+        tk.Button(
+            modes,
+            text="AUTO",
+            command=lambda: self.write_register(
+                REG["MODE"],
+                1
+            ),
+            bg=BLUE_DARK,
+            fg=TEXT,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2"
+        ).pack(
+            side="left",
+            fill="x",
+            expand=True,
+            padx=(0, 5),
+            ipady=5
+        )
+
+        tk.Button(
+            modes,
+            text="MANUAL",
+            command=lambda: self.write_register(
+                REG["MODE"],
+                0
+            ),
+            bg="#334155",
+            fg=TEXT,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2"
+        ).pack(
+            side="left",
+            fill="x",
+            expand=True,
+            padx=(5, 0),
+            ipady=5
+        )
+
+        tk.Label(
+            panel,
+            text="SETPOINTS",
+            bg=PANEL,
+            fg=MUTED,
+            font=("Segoe UI", 8, "bold")
+        ).pack(
+            anchor="w",
+            padx=18,
+            pady=(18, 5)
+        )
+
+        self.rpm_entry = self.entry_row(
+            panel,
+            "Speed RPM"
+        )
+
+        self.pressure_entry = self.entry_row(
+            panel,
+            "Pressure bar"
+        )
+
+        tk.Button(
+            panel,
+            text="APPLY SETPOINTS",
+            command=self.apply_setpoints,
+            bg=BLUE_DARK,
+            fg=TEXT,
+            activebackground=BLUE,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2"
+        ).pack(
+            fill="x",
+            padx=15,
+            pady=10,
+            ipady=5
+        )
+
+        tk.Button(
+            panel,
+            text="⚠  EMERGENCY STOP",
+            command=lambda: self.write_register(
+                REG["EMERGENCY_STOP"],
+                1
+            ),
+            bg=RED_DARK,
+            fg=TEXT,
+            activebackground=RED,
+            relief="flat",
+            font=("Segoe UI", 10, "bold"),
+            cursor="hand2"
+        ).pack(
+            fill="x",
+            padx=15,
+            pady=4,
+            ipady=7
+        )
+
+        tk.Button(
+            panel,
+            text="RESET E-STOP",
+            command=lambda: self.write_register(
+                REG["EMERGENCY_STOP"],
+                0
+            ),
+            bg="#334155",
+            fg=TEXT,
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2"
+        ).pack(
+            fill="x",
+            padx=15,
+            pady=(0, 15),
+            ipady=5
+        )
+
+    def entry_row(self, parent, label):
 
         frame = tk.Frame(
             parent,
-            bg="#0d1117",
+            bg=PANEL
         )
 
         frame.pack(
             fill="x",
-            padx=25,
-            pady=8,
-        )
-
-        cards = [
-            ("MOTOR", self.motor_var),
-            ("RPM", self.rpm_var),
-            ("CURRENT", self.current_var),
-            ("PRESSURE", self.pressure_var),
-            ("TEMPERATURE", self.temperature_var),
-            ("MODE", self.mode_var),
-        ]
-
-        for index, (
-            title,
-            variable,
-        ) in enumerate(cards):
-
-            card = tk.Frame(
-                frame,
-                bg="#161b22",
-                highlightbackground="#30363d",
-                highlightthickness=1,
-            )
-
-            card.grid(
-                row=index // 3,
-                column=index % 3,
-                padx=5,
-                pady=5,
-                sticky="nsew",
-            )
-
-            frame.grid_columnconfigure(
-                index % 3,
-                weight=1,
-            )
-
-            tk.Label(
-                card,
-                text=title,
-                bg="#161b22",
-                fg="#8b949e",
-                font=("Segoe UI", 9, "bold"),
-            ).pack(
-                anchor="w",
-                padx=15,
-                pady=(12, 2),
-            )
-
-            tk.Label(
-                card,
-                textvariable=variable,
-                bg="#161b22",
-                fg="#ffffff",
-                font=("Segoe UI", 19, "bold"),
-            ).pack(
-                anchor="w",
-                padx=15,
-                pady=(2, 14),
-            )
-
-    # ========================================================
-    # STATUS PANEL
-    # ========================================================
-
-    def create_status_panel(
-        self,
-        parent,
-    ) -> None:
-
-        frame = tk.Frame(
-            parent,
-            bg="#161b22",
-            highlightbackground="#30363d",
-            highlightthickness=1,
-        )
-
-        frame.pack(
-            fill="x",
-            padx=25,
-            pady=8,
+            padx=15,
+            pady=3
         )
 
         tk.Label(
             frame,
-            text="PLC STATUS",
-            bg="#161b22",
-            fg="#58a6ff",
-            font=("Segoe UI", 12, "bold"),
-        ).grid(
-            row=0,
-            column=0,
-            columnspan=6,
-            sticky="w",
-            padx=15,
-            pady=(12, 10),
+            text=label,
+            bg=PANEL,
+            fg=TEXT,
+            font=("Segoe UI", 9)
+        ).pack(
+            side="left"
         )
+
+        entry = tk.Entry(
+            frame,
+            bg=PANEL_2,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            justify="center",
+            font=("Consolas", 10),
+            width=12
+        )
+
+        entry.pack(
+            side="right",
+            ipady=5
+        )
+
+        return entry
+
+    # ========================================================
+    # STATUS
+    # ========================================================
+
+    def build_status_panel(self, parent):
+
+        panel = tk.Frame(
+            parent,
+            bg=PANEL,
+            highlightbackground=BORDER,
+            highlightthickness=1
+        )
+
+        panel.pack(
+            fill="both",
+            expand=True,
+            padx=5,
+            pady=5
+        )
+
+        tk.Label(
+            panel,
+            text="PLC STATUS",
+            bg=PANEL,
+            fg=TEXT,
+            font=("Segoe UI", 11, "bold")
+        ).pack(
+            anchor="w",
+            padx=18,
+            pady=(15, 10)
+        )
+
+        self.status_items = {}
 
         items = [
-            ("ALARM", self.alarm_var),
-            ("FAULT", self.fault_var),
-            ("E-STOP", self.estop_var),
-            ("HEARTBEAT", self.heartbeat_var),
-            ("RUNTIME", self.runtime_var),
-            ("STATUS WORD", self.status_word_var),
+            ("MODE", "--"),
+            ("ALARM", "NO"),
+            ("FAULT", "NONE"),
+            ("E-STOP", "RELEASED"),
+            ("HEARTBEAT", "--"),
+            ("RUNTIME", "0 s"),
         ]
 
-        for column, (
-            title,
-            variable,
-        ) in enumerate(items):
+        for name, value in items:
 
-            tk.Label(
-                frame,
-                text=title,
-                bg="#161b22",
-                fg="#8b949e",
-                font=("Segoe UI", 8, "bold"),
-            ).grid(
-                row=1,
-                column=column,
-                padx=12,
-                pady=(5, 2),
+            row = tk.Frame(
+                panel,
+                bg=PANEL
             )
 
-            label = tk.Label(
-                frame,
-                textvariable=variable,
-                bg="#161b22",
-                fg="#ffffff",
-                font=("Segoe UI", 10, "bold"),
-            )
-
-            label.grid(
-                row=2,
-                column=column,
-                padx=12,
-                pady=(2, 14),
-            )
-
-            if title == "ALARM":
-                self.alarm_label = label
-
-            if title == "E-STOP":
-                self.estop_label = label
-
-            if title == "FAULT":
-                self.fault_label = label
-
-    # ========================================================
-    # CONTROL PANEL
-    # ========================================================
-
-    def create_control_panel(
-        self,
-        parent,
-    ) -> None:
-
-        frame = tk.Frame(
-            parent,
-            bg="#161b22",
-            highlightbackground="#30363d",
-            highlightthickness=1,
-        )
-
-        frame.pack(
-            fill="x",
-            padx=25,
-            pady=8,
-        )
-
-        tk.Label(
-            frame,
-            text="MOTOR CONTROL",
-            bg="#161b22",
-            fg="#58a6ff",
-            font=("Segoe UI", 12, "bold"),
-        ).grid(
-            row=0,
-            column=0,
-            columnspan=4,
-            sticky="w",
-            padx=15,
-            pady=(14, 10),
-        )
-
-        self.make_button(
-            frame,
-            "START",
-            self.start_motor,
-            "#238636",
-            "#2ea043",
-        ).grid(
-            row=1,
-            column=0,
-            padx=10,
-            pady=8,
-            sticky="ew",
-        )
-
-        self.make_button(
-            frame,
-            "STOP",
-            self.stop_motor,
-            "#da3633",
-            "#f85149",
-        ).grid(
-            row=1,
-            column=1,
-            padx=10,
-            pady=8,
-            sticky="ew",
-        )
-
-        self.make_button(
-            frame,
-            "AUTO",
-            self.set_auto,
-            "#1f6feb",
-            "#388bfd",
-        ).grid(
-            row=1,
-            column=2,
-            padx=10,
-            pady=8,
-            sticky="ew",
-        )
-
-        self.make_button(
-            frame,
-            "MANUAL",
-            self.set_manual,
-            "#8957e5",
-            "#a371f7",
-        ).grid(
-            row=1,
-            column=3,
-            padx=10,
-            pady=8,
-            sticky="ew",
-        )
-
-        for column in range(4):
-
-            frame.grid_columnconfigure(
-                column,
-                weight=1,
-            )
-
-        self.make_button(
-            frame,
-            "⚠ EMERGENCY STOP",
-            self.emergency_stop,
-            "#b62324",
-            "#f85149",
-        ).grid(
-            row=2,
-            column=0,
-            columnspan=2,
-            padx=10,
-            pady=(8, 15),
-            sticky="ew",
-        )
-
-        self.make_button(
-            frame,
-            "RESET E-STOP",
-            self.reset_emergency_stop,
-            "#9e6a03",
-            "#d29922",
-        ).grid(
-            row=2,
-            column=2,
-            columnspan=2,
-            padx=10,
-            pady=(8, 15),
-            sticky="ew",
-        )
-
-    # ========================================================
-    # SETPOINT PANEL
-    # ========================================================
-
-    def create_setpoint_panel(
-        self,
-        parent,
-    ) -> None:
-
-        frame = tk.Frame(
-            parent,
-            bg="#161b22",
-            highlightbackground="#30363d",
-            highlightthickness=1,
-        )
-
-        frame.pack(
-            fill="x",
-            padx=25,
-            pady=8,
-        )
-
-        tk.Label(
-            frame,
-            text="SETPOINT CONTROL",
-            bg="#161b22",
-            fg="#58a6ff",
-            font=("Segoe UI", 12, "bold"),
-        ).grid(
-            row=0,
-            column=0,
-            columnspan=4,
-            sticky="w",
-            padx=15,
-            pady=(14, 10),
-        )
-
-        # RPM
-        tk.Label(
-            frame,
-            text="CURRENT RPM SETPOINT",
-            bg="#161b22",
-            fg="#8b949e",
-            font=("Segoe UI", 9, "bold"),
-        ).grid(
-            row=1,
-            column=0,
-            padx=15,
-            pady=8,
-            sticky="w",
-        )
-
-        tk.Label(
-            frame,
-            textvariable=self.speed_setpoint_var,
-            bg="#161b22",
-            fg="#ffffff",
-            font=("Segoe UI", 11, "bold"),
-        ).grid(
-            row=1,
-            column=1,
-            padx=10,
-            pady=8,
-        )
-
-        ttk.Entry(
-            frame,
-            textvariable=self.rpm_entry_var,
-            width=14,
-        ).grid(
-            row=1,
-            column=2,
-            padx=10,
-            pady=8,
-        )
-
-        self.make_button(
-            frame,
-            "WRITE RPM",
-            self.write_rpm,
-            "#1f6feb",
-            "#388bfd",
-        ).grid(
-            row=1,
-            column=3,
-            padx=10,
-            pady=8,
-        )
-
-        # Pressure
-        tk.Label(
-            frame,
-            text="CURRENT PRESSURE SETPOINT",
-            bg="#161b22",
-            fg="#8b949e",
-            font=("Segoe UI", 9, "bold"),
-        ).grid(
-            row=2,
-            column=0,
-            padx=15,
-            pady=(8, 15),
-            sticky="w",
-        )
-
-        tk.Label(
-            frame,
-            textvariable=self.pressure_setpoint_var,
-            bg="#161b22",
-            fg="#ffffff",
-            font=("Segoe UI", 11, "bold"),
-        ).grid(
-            row=2,
-            column=1,
-            padx=10,
-            pady=(8, 15),
-        )
-
-        ttk.Entry(
-            frame,
-            textvariable=self.pressure_entry_var,
-            width=14,
-        ).grid(
-            row=2,
-            column=2,
-            padx=10,
-            pady=(8, 15),
-        )
-
-        self.make_button(
-            frame,
-            "WRITE PRESSURE",
-            self.write_pressure,
-            "#1f6feb",
-            "#388bfd",
-        ).grid(
-            row=2,
-            column=3,
-            padx=10,
-            pady=(8, 15),
-        )
-
-    # ========================================================
-    # STATUS BITS
-    # ========================================================
-
-    def create_status_bits_panel(
-        self,
-        parent,
-    ) -> None:
-
-        frame = tk.Frame(
-            parent,
-            bg="#161b22",
-            highlightbackground="#30363d",
-            highlightthickness=1,
-        )
-
-        frame.pack(
-            fill="x",
-            padx=25,
-            pady=8,
-        )
-
-        tk.Label(
-            frame,
-            text="STATUS WORD / PLC FLAGS",
-            bg="#161b22",
-            fg="#58a6ff",
-            font=("Segoe UI", 12, "bold"),
-        ).grid(
-            row=0,
-            column=0,
-            columnspan=4,
-            sticky="w",
-            padx=15,
-            pady=(14, 10),
-        )
-
-        for index, (
-            bit,
-            name,
-        ) in enumerate(STATUS_BITS):
-
-            variable = tk.StringVar(
-                value="OFF"
-            )
-
-            self.status_bit_vars[bit] = variable
-
-            row = 1 + index // 4
-            column = index % 4
-
-            card = tk.Frame(
-                frame,
-                bg="#0d1117",
-            )
-
-            card.grid(
-                row=row,
-                column=column,
-                padx=6,
-                pady=6,
-                sticky="ew",
-            )
-
-            frame.grid_columnconfigure(
-                column,
-                weight=1,
+            row.pack(
+                fill="x",
+                padx=18,
+                pady=4
             )
 
             tk.Label(
-                card,
-                text=f"BIT {bit}",
-                bg="#0d1117",
-                fg="#8b949e",
-                font=("Consolas", 8),
-            ).pack(
-                anchor="w",
-                padx=10,
-                pady=(6, 0),
-            )
-
-            tk.Label(
-                card,
+                row,
                 text=name,
-                bg="#0d1117",
-                fg="#ffffff",
-                font=("Segoe UI", 9, "bold"),
+                bg=PANEL,
+                fg=MUTED,
+                font=("Segoe UI", 8, "bold")
             ).pack(
-                anchor="w",
-                padx=10,
+                side="left"
             )
 
             label = tk.Label(
-                card,
-                textvariable=variable,
-                bg="#0d1117",
-                fg="#f85149",
-                font=("Segoe UI", 9, "bold"),
+                row,
+                text=value,
+                bg=PANEL,
+                fg=TEXT,
+                font=("Consolas", 9, "bold")
             )
 
             label.pack(
-                anchor="w",
-                padx=10,
-                pady=(0, 6),
+                side="right"
             )
 
-            variable._label = label
+            self.status_items[name] = label
 
     # ========================================================
-    # REGISTER MONITOR
+    # TRENDS
     # ========================================================
 
-    def create_register_panel(
-        self,
-        parent,
-    ) -> None:
+    def build_trends(self):
+
+        tk.Label(
+            self.trend_tab,
+            text="REAL-TIME PROCESS TRENDS",
+            bg=BG,
+            fg=TEXT,
+            font=("Segoe UI", 13, "bold")
+        ).pack(
+            anchor="w",
+            padx=20,
+            pady=(18, 5)
+        )
+
+        self.canvas = tk.Canvas(
+            self.trend_tab,
+            bg=PANEL,
+            highlightthickness=0
+        )
+
+        self.canvas.pack(
+            fill="both",
+            expand=True,
+            padx=20,
+            pady=20
+        )
+
+        self.canvas.bind(
+            "<Configure>",
+            lambda event: self.draw_trends()
+        )
+
+    # ========================================================
+    # REGISTERS
+    # ========================================================
+
+    def build_registers(self):
+
+        tk.Label(
+            self.register_tab,
+            text="MODBUS REGISTER MONITOR",
+            bg=BG,
+            fg=TEXT,
+            font=("Segoe UI", 13, "bold")
+        ).pack(
+            anchor="w",
+            padx=20,
+            pady=(18, 10)
+        )
 
         frame = tk.Frame(
-            parent,
-            bg="#161b22",
-            highlightbackground="#30363d",
-            highlightthickness=1,
+            self.register_tab,
+            bg=PANEL
         )
 
         frame.pack(
             fill="both",
-            padx=25,
-            pady=(8, 25),
-        )
-
-        tk.Label(
-            frame,
-            text="MODBUS REGISTER MONITOR",
-            bg="#161b22",
-            fg="#58a6ff",
-            font=("Segoe UI", 12, "bold"),
-        ).pack(
-            anchor="w",
-            padx=15,
-            pady=(14, 10),
-        )
-
-        tree_frame = tk.Frame(
-            frame,
-            bg="#161b22",
-        )
-
-        tree_frame.pack(
-            fill="both",
             expand=True,
-            padx=12,
-            pady=(0, 12),
+            padx=20,
+            pady=(0, 20)
         )
 
         columns = (
             "address",
             "name",
-            "value",
-            "hex",
+            "raw",
+            "engineering"
         )
 
         self.register_tree = ttk.Treeview(
-            tree_frame,
+            frame,
             columns=columns,
-            show="headings",
-            height=21,
+            show="headings"
         )
 
-        self.register_tree.heading(
-            "address",
-            text="ADDRESS",
-        )
+        headings = {
+            "address": "ADDRESS",
+            "name": "REGISTER",
+            "raw": "RAW",
+            "engineering": "ENGINEERING VALUE"
+        }
 
-        self.register_tree.heading(
-            "name",
-            text="REGISTER",
-        )
+        for column, title in headings.items():
 
-        self.register_tree.heading(
-            "value",
-            text="VALUE",
-        )
-
-        self.register_tree.heading(
-            "hex",
-            text="HEX",
-        )
+            self.register_tree.heading(
+                column,
+                text=title
+            )
 
         self.register_tree.column(
             "address",
-            width=80,
-            anchor="center",
+            width=100,
+            anchor="center"
         )
 
         self.register_tree.column(
             "name",
-            width=250,
-            anchor="w",
+            width=300
         )
 
         self.register_tree.column(
-            "value",
+            "raw",
             width=150,
-            anchor="center",
+            anchor="center"
         )
 
         self.register_tree.column(
-            "hex",
-            width=150,
-            anchor="center",
+            "engineering",
+            width=300
         )
 
-        tree_scroll = ttk.Scrollbar(
-            tree_frame,
+        scrollbar = ttk.Scrollbar(
+            frame,
             orient="vertical",
-            command=self.register_tree.yview,
+            command=self.register_tree.yview
         )
 
         self.register_tree.configure(
-            yscrollcommand=tree_scroll.set,
+            yscrollcommand=scrollbar.set
         )
 
         self.register_tree.pack(
             side="left",
             fill="both",
-            expand=True,
+            expand=True
         )
 
-        tree_scroll.pack(
+        scrollbar.pack(
             side="right",
-            fill="y",
+            fill="y"
         )
 
-        for address in range(
-            REGISTER_COUNT
-        ):
+        self.register_rows = {}
 
-            self.register_tree.insert(
+        register_names = [
+            ("MOTOR_COMMAND", 40001),
+            ("MODE", 40002),
+            ("SPEED_SETPOINT", 40003),
+            ("ACTUAL_RPM", 40005),
+            ("CURRENT", 40007),
+            ("PRESSURE_SETPOINT", 40009),
+            ("ACTUAL_PRESSURE", 40011),
+            ("TEMPERATURE", 40013),
+            ("ALARM", 40015),
+            ("EMERGENCY_STOP", 40016),
+            ("HEARTBEAT", 40017),
+            ("STATUS_WORD", 40018),
+            ("FAULT_CODE", 40019),
+            ("RUNTIME_SECONDS", 40020),
+        ]
+
+        for name, address in register_names:
+
+            item = self.register_tree.insert(
                 "",
                 "end",
-                iid=str(address),
                 values=(
                     address,
-                    REGISTER_NAMES.get(
-                        address,
-                        "UNKNOWN",
-                    ),
-                    0,
-                    "0x0000",
-                ),
+                    name,
+                    "--",
+                    "--"
+                )
             )
 
+            self.register_rows[name] = item
+
     # ========================================================
-    # BUTTON FACTORY
+    # DIAGNOSTICS
     # ========================================================
 
-    def make_button(
+    def build_diagnostics(self):
+
+        top = tk.Frame(
+            self.diagnostics_tab,
+            bg=BG
+        )
+
+        top.pack(
+            fill="x",
+            padx=20,
+            pady=20
+        )
+
+        self.diagnostic_connection = self.diagnostic_card(
+            top,
+            "CONNECTION",
+            "DISCONNECTED"
+        )
+
+        self.diagnostic_heartbeat = self.diagnostic_card(
+            top,
+            "HEARTBEAT",
+            "--"
+        )
+
+        self.diagnostic_runtime = self.diagnostic_card(
+            top,
+            "RUNTIME",
+            "0 s"
+        )
+
+        self.diagnostic_fault = self.diagnostic_card(
+            top,
+            "FAULT",
+            "NONE"
+        )
+
+        panel = tk.Frame(
+            self.diagnostics_tab,
+            bg=PANEL,
+            highlightbackground=BORDER,
+            highlightthickness=1
+        )
+
+        panel.pack(
+            fill="both",
+            expand=True,
+            padx=20,
+            pady=(0, 20)
+        )
+
+        tk.Label(
+            panel,
+            text="STATUS WORD",
+            bg=PANEL,
+            fg=TEXT,
+            font=("Segoe UI", 11, "bold")
+        ).pack(
+            anchor="w",
+            padx=20,
+            pady=(18, 10)
+        )
+
+        self.status_bit_labels = {}
+
+        for bit, name in STATUS_BITS:
+
+            row = tk.Frame(
+                panel,
+                bg=PANEL
+            )
+
+            row.pack(
+                fill="x",
+                padx=20,
+                pady=5
+            )
+
+            indicator = tk.Label(
+                row,
+                text="●",
+                bg=PANEL,
+                fg="#475569",
+                font=("Segoe UI", 15)
+            )
+
+            indicator.pack(
+                side="left"
+            )
+
+            tk.Label(
+                row,
+                text=f"BIT {bit:02d}",
+                bg=PANEL,
+                fg=MUTED,
+                font=("Consolas", 9)
+            ).pack(
+                side="left",
+                padx=10
+            )
+
+            tk.Label(
+                row,
+                text=name,
+                bg=PANEL,
+                fg=TEXT,
+                font=("Segoe UI", 9, "bold")
+            ).pack(
+                side="left"
+            )
+
+            self.status_bit_labels[bit] = indicator
+
+    def diagnostic_card(
         self,
         parent,
-        text,
-        command,
-        background,
-        active_background,
+        title,
+        value
     ):
 
-        return tk.Button(
+        card = tk.Frame(
             parent,
-            text=text,
-            command=command,
-            bg=background,
-            fg="white",
-            activebackground=active_background,
-            activeforeground="white",
-            font=("Segoe UI", 10, "bold"),
-            relief="flat",
-            bd=0,
-            padx=18,
-            pady=10,
-            cursor="hand2",
+            bg=PANEL,
+            highlightbackground=BORDER,
+            highlightthickness=1
         )
 
-    # ========================================================
-    # MODBUS CONNECTION
-    # ========================================================
-
-    def connect(self) -> bool:
-
-        try:
-
-            if self.client.is_socket_open():
-
-                self.connected = True
-
-                return True
-
-            result = self.client.connect()
-
-            self.connected = bool(result)
-
-            return self.connected
-
-        except Exception:
-
-            self.connected = False
-
-            return False
-
-    # ========================================================
-    # READ REGISTERS
-    # ========================================================
-
-    def read_registers(
-        self,
-    ):
-
-        if not self.connect():
-
-            return None
-
-        try:
-
-            result = self.client.read_holding_registers(
-                address=0,
-                count=REGISTER_COUNT,
-                device_id=UNIT_ID,
-            )
-
-            if result.isError():
-
-                self.connected = False
-
-                return None
-
-            if len(result.registers) < REGISTER_COUNT:
-
-                self.connected = False
-
-                return None
-
-            return result.registers
-
-        except Exception:
-
-            self.connected = False
-
-            return None
-
-    # ========================================================
-    # CONNECTION UPDATE
-    # ========================================================
-
-    def update_connection(self):
-
-        registers = self.read_registers()
-
-        if registers is None:
-
-            self.connection_var.set(
-                "● DISCONNECTED"
-            )
-
-            self.connection_label.configure(
-                fg="#f85149"
-            )
-
-            self.root.after(
-                REFRESH_MS,
-                self.update_connection,
-            )
-
-            return
-
-        self.connection_var.set(
-            "● CONNECTED"
+        card.pack(
+            side="left",
+            fill="both",
+            expand=True,
+            padx=5
         )
 
-        self.connection_label.configure(
-            fg="#3fb950"
+        tk.Label(
+            card,
+            text=title,
+            bg=PANEL,
+            fg=MUTED,
+            font=("Segoe UI", 8, "bold")
+        ).pack(
+            anchor="w",
+            padx=15,
+            pady=(12, 3)
         )
 
-        self.update_values(
-            registers
+        label = tk.Label(
+            card,
+            text=value,
+            bg=PANEL,
+            fg=TEXT,
+            font=("Consolas", 13, "bold")
+        )
+
+        label.pack(
+            anchor="w",
+            padx=15,
+            pady=(0, 12)
+        )
+
+        return label
+
+    # ========================================================
+    # FOOTER
+    # ========================================================
+
+    def build_footer(self):
+
+        footer = tk.Frame(
+            self.root,
+            bg=PANEL,
+            height=30
+        )
+
+        footer.pack(
+            fill="x"
+        )
+
+        footer.pack_propagate(False)
+
+        self.footer_status = tk.Label(
+            footer,
+            text="Connecting to PLC...",
+            bg=PANEL,
+            fg=MUTED,
+            font=("Consolas", 8)
+        )
+
+        self.footer_status.pack(
+            side="left",
+            padx=15
+        )
+
+        self.clock_label = tk.Label(
+            footer,
+            text="--:--:--",
+            bg=PANEL,
+            fg=MUTED,
+            font=("Consolas", 8)
+        )
+
+        self.clock_label.pack(
+            side="right",
+            padx=15
+        )
+
+        self.update_clock()
+
+    # ========================================================
+    # CONNECTION
+    # ========================================================
+
+    def start_connection(self):
+
+        success = self.modbus.connect()
+
+        self.set_connection_status(
+            success
         )
 
         self.root.after(
-            REFRESH_MS,
-            self.update_connection,
+            POLL_INTERVAL_MS,
+            self.poll
         )
 
-    # ========================================================
-    # UPDATE VALUES
-    # ========================================================
-
-    def update_values(
+    def set_connection_status(
         self,
-        registers: list[int],
-    ) -> None:
+        connected
+    ):
 
-        motor_command = safe_register(
-            registers,
-            MOTOR_COMMAND,
+        if connected:
+
+            self.connection_dot.config(
+                fg=GREEN
+            )
+
+            self.connection_label.config(
+                text="CONNECTED",
+                fg=GREEN
+            )
+
+            self.diagnostic_connection.config(
+                text="CONNECTED",
+                fg=GREEN
+            )
+
+        else:
+
+            self.connection_dot.config(
+                fg=RED
+            )
+
+            self.connection_label.config(
+                text="DISCONNECTED",
+                fg=RED
+            )
+
+            self.diagnostic_connection.config(
+                text="DISCONNECTED",
+                fg=RED
+            )
+
+    # ========================================================
+    # POLLING
+    # ========================================================
+
+    def poll(self):
+
+        if not self.running:
+            return
+
+        data = self.modbus.read_registers()
+
+        if data is None:
+
+            self.set_connection_status(
+                False
+            )
+
+            self.footer_status.config(
+                text="PLC OFFLINE — reconnecting..."
+            )
+
+            self.root.after(
+                1000,
+                self.reconnect
+            )
+
+        else:
+
+            self.set_connection_status(
+                True
+            )
+
+            self.process_data(
+                data
+            )
+
+        self.root.after(
+            POLL_INTERVAL_MS,
+            self.poll
         )
 
-        mode = safe_register(
-            registers,
-            MODE,
+    def reconnect(self):
+
+        if not self.running:
+            return
+
+        if not self.modbus.connected:
+
+            success = self.modbus.connect()
+
+            self.set_connection_status(
+                success
+            )
+
+    # ========================================================
+    # DATA
+    # ========================================================
+
+    def read_uint32(
+        self,
+        data,
+        address
+    ):
+
+        if address + 1 >= len(data):
+            return 0
+
+        return (
+            (data[address] << 16)
+            | data[address + 1]
         )
 
-        speed_setpoint = uint32_from_registers(
-            safe_register(
-                registers,
-                SPEED_SETPOINT_HI,
-            ),
-            safe_register(
-                registers,
-                SPEED_SETPOINT_LO,
-            ),
+    def process_data(
+        self,
+        data
+    ):
+
+        motor_command = data[
+            REG["MOTOR_COMMAND"]
+        ]
+
+        mode = data[
+            REG["MODE"]
+        ]
+
+        speed_setpoint = self.read_uint32(
+            data,
+            REG["SPEED_SETPOINT"]
         )
 
-        actual_rpm = uint32_from_registers(
-            safe_register(
-                registers,
-                ACTUAL_RPM_HI,
-            ),
-            safe_register(
-                registers,
-                ACTUAL_RPM_LO,
-            ),
-        )
-
-        current_raw = uint32_from_registers(
-            safe_register(
-                registers,
-                CURRENT_HI,
-            ),
-            safe_register(
-                registers,
-                CURRENT_LO,
-            ),
-        )
-
-        pressure_setpoint_raw = uint32_from_registers(
-            safe_register(
-                registers,
-                PRESSURE_SETPOINT_HI,
-            ),
-            safe_register(
-                registers,
-                PRESSURE_SETPOINT_LO,
-            ),
-        )
-
-        actual_pressure_raw = uint32_from_registers(
-            safe_register(
-                registers,
-                ACTUAL_PRESSURE_HI,
-            ),
-            safe_register(
-                registers,
-                ACTUAL_PRESSURE_LO,
-            ),
-        )
-
-        temperature_raw = uint32_from_registers(
-            safe_register(
-                registers,
-                TEMPERATURE_HI,
-            ),
-            safe_register(
-                registers,
-                TEMPERATURE_LO,
-            ),
-        )
-
-        alarm = safe_register(
-            registers,
-            ALARM,
-        )
-
-        emergency_stop = safe_register(
-            registers,
-            EMERGENCY_STOP,
-        )
-
-        heartbeat = safe_register(
-            registers,
-            HEARTBEAT,
-        )
-
-        status_word = safe_register(
-            registers,
-            STATUS_WORD,
-        )
-
-        fault_code = safe_register(
-            registers,
-            FAULT_CODE,
-        )
-
-        runtime = uint32_from_registers(
-            safe_register(
-                registers,
-                RUNTIME_SECONDS_HI,
-            ),
-            safe_register(
-                registers,
-                RUNTIME_SECONDS_LO,
-            ),
+        actual_rpm = self.read_uint32(
+            data,
+            REG["ACTUAL_RPM"]
         )
 
         current = (
-            current_raw / 10.0
+            self.read_uint32(
+                data,
+                REG["CURRENT"]
+            )
+            / 10.0
         )
 
         pressure_setpoint = (
-            pressure_setpoint_raw / 10.0
+            self.read_uint32(
+                data,
+                REG["PRESSURE_SETPOINT"]
+            )
+            / 10.0
         )
 
-        actual_pressure = (
-            actual_pressure_raw / 10.0
+        pressure = (
+            self.read_uint32(
+                data,
+                REG["ACTUAL_PRESSURE"]
+            )
+            / 10.0
         )
 
         temperature = (
-            temperature_raw / 10.0
+            self.read_uint32(
+                data,
+                REG["TEMPERATURE"]
+            )
+            / 10.0
+        )
+
+        alarm = data[
+            REG["ALARM"]
+        ]
+
+        emergency_stop = data[
+            REG["EMERGENCY_STOP"]
+        ]
+
+        heartbeat = data[
+            REG["HEARTBEAT"]
+        ]
+
+        status_word = data[
+            REG["STATUS_WORD"]
+        ]
+
+        fault_code = data[
+            REG["FAULT_CODE"]
+        ]
+
+        runtime = self.read_uint32(
+            data,
+            REG["RUNTIME"]
         )
 
         # ----------------------------------------------------
-        # MAIN VALUES
+        # VALUES
         # ----------------------------------------------------
 
-        self.motor_var.set(
-            "ON"
-            if motor_command == 1
-            else "OFF"
+        self.rpm_value.config(
+            text=f"{actual_rpm:,}"
         )
 
-        self.mode_var.set(
-            "AUTO"
-            if mode == 1
-            else "MANUAL"
+        self.current_value.config(
+            text=f"{current:.1f}"
         )
 
-        self.speed_setpoint_var.set(
-            f"{speed_setpoint} RPM"
+        self.pressure_value.config(
+            text=f"{pressure:.1f}"
         )
 
-        self.rpm_var.set(
-            f"{actual_rpm} RPM"
+        self.temperature_value.config(
+            text=f"{temperature:.1f}"
         )
 
-        self.current_var.set(
-            f"{current:.1f} A"
+        self.motor_progress["value"] = min(
+            actual_rpm,
+            MAX_RPM
         )
 
-        self.pressure_setpoint_var.set(
-            f"{pressure_setpoint:.1f} bar"
+        # ----------------------------------------------------
+        # STATE
+        # ----------------------------------------------------
+
+        state = self.get_motor_state(
+            actual_rpm,
+            speed_setpoint,
+            motor_command,
+            fault_code
         )
 
-        self.pressure_var.set(
-            f"{actual_pressure:.1f} bar"
+        self.motor_state_label.config(
+            text=state[0],
+            fg=state[1]
         )
 
-        self.temperature_var.set(
-            f"{temperature:.1f} °C"
+        # ----------------------------------------------------
+        # STATUS
+        # ----------------------------------------------------
+
+        self.status_items[
+            "MODE"
+        ].config(
+            text="AUTO" if mode else "MANUAL",
+            fg=BLUE if mode else TEXT
+        )
+
+        self.status_items[
+            "ALARM"
+        ].config(
+            text="ACTIVE" if alarm else "NO",
+            fg=RED if alarm else GREEN
+        )
+
+        fault_name = FAULT_CODES.get(
+            fault_code,
+            f"UNKNOWN ({fault_code})"
+        )
+
+        self.status_items[
+            "FAULT"
+        ].config(
+            text=fault_name,
+            fg=RED if fault_code else GREEN
+        )
+
+        self.status_items[
+            "E-STOP"
+        ].config(
+            text=(
+                "ACTIVE"
+                if emergency_stop
+                else "RELEASED"
+            ),
+            fg=RED if emergency_stop else GREEN
+        )
+
+        self.status_items[
+            "HEARTBEAT"
+        ].config(
+            text=str(heartbeat)
+        )
+
+        self.status_items[
+            "RUNTIME"
+        ].config(
+            text=f"{runtime:,} s"
+        )
+
+        # ----------------------------------------------------
+        # DIAGNOSTICS
+        # ----------------------------------------------------
+
+        self.diagnostic_heartbeat.config(
+            text=str(heartbeat)
+        )
+
+        self.diagnostic_runtime.config(
+            text=f"{runtime:,} s"
+        )
+
+        self.diagnostic_fault.config(
+            text=fault_name,
+            fg=RED if fault_code else GREEN
         )
 
         # ----------------------------------------------------
         # ALARM
         # ----------------------------------------------------
 
-        if alarm:
-
-            self.alarm_var.set(
-                "ALARM ACTIVE"
-            )
-
-            self.alarm_label.configure(
-                fg="#f85149"
-            )
-
-        else:
-
-            self.alarm_var.set(
-                "NORMAL"
-            )
-
-            self.alarm_label.configure(
-                fg="#3fb950"
-            )
-
-        # ----------------------------------------------------
-        # E-STOP
-        # ----------------------------------------------------
-
-        if emergency_stop:
-
-            self.estop_var.set(
-                "ACTIVE"
-            )
-
-            self.estop_label.configure(
-                fg="#f85149"
-            )
-
-        else:
-
-            self.estop_var.set(
-                "RELEASED"
-            )
-
-            self.estop_label.configure(
-                fg="#3fb950"
-            )
-
-        # ----------------------------------------------------
-        # FAULT
-        # ----------------------------------------------------
-
-        self.fault_var.set(
-            FAULT_NAMES.get(
-                fault_code,
-                f"UNKNOWN ({fault_code})",
-            )
+        self.update_alarm(
+            alarm,
+            emergency_stop,
+            fault_code
         )
 
-        if fault_code != 0:
-
-            self.fault_label.configure(
-                fg="#f85149"
-            )
-
-        else:
-
-            self.fault_label.configure(
-                fg="#3fb950"
-            )
-
         # ----------------------------------------------------
-        # OTHER STATUS
+        # TRENDS
         # ----------------------------------------------------
 
-        self.heartbeat_var.set(
-            str(heartbeat)
+        self.rpm_history.append(
+            actual_rpm
         )
 
-        self.runtime_var.set(
-            f"{runtime} s"
+        self.pressure_history.append(
+            pressure
         )
 
-        self.status_word_var.set(
-            f"0x{status_word:04X}"
+        self.temperature_history.append(
+            temperature
+        )
+
+        self.draw_trends()
+
+        # ----------------------------------------------------
+        # REGISTERS
+        # ----------------------------------------------------
+
+        self.update_register_table(
+            data,
+            speed_setpoint,
+            actual_rpm,
+            current,
+            pressure_setpoint,
+            pressure,
+            temperature,
+            runtime
         )
 
         # ----------------------------------------------------
         # STATUS BITS
         # ----------------------------------------------------
 
-        for bit, name in STATUS_BITS:
+        self.update_status_bits(
+            status_word
+        )
+
+        # ----------------------------------------------------
+        # SETPOINTS
+        #
+        # IMPORTANT:
+        # Do NOT overwrite the Entry while the user is
+        # currently typing in it.
+        # ----------------------------------------------------
+
+        self.update_entry(
+            self.rpm_entry,
+            str(speed_setpoint)
+        )
+
+        self.update_entry(
+            self.pressure_entry,
+            f"{pressure_setpoint:.1f}"
+        )
+
+        self.footer_status.config(
+            text=(
+                f"PLC ONLINE  |  "
+                f"Heartbeat {heartbeat}  |  "
+                f"{PLC_IP}:{PLC_PORT}"
+            )
+        )
+
+    # ========================================================
+    # MOTOR STATE
+    # ========================================================
+
+    def get_motor_state(
+        self,
+        actual_rpm,
+        setpoint,
+        command,
+        fault
+    ):
+
+        if fault:
+            return "FAULT", RED
+
+        if actual_rpm == 0:
+
+            if command:
+                return "STARTING", AMBER
+
+            return "STOPPED", GREEN
+
+        if command:
+
+            if actual_rpm < setpoint:
+                return "STARTING", AMBER
+
+            if actual_rpm > setpoint:
+                return "STOPPING", AMBER
+
+            return "RUNNING", GREEN
+
+        return "STOPPING", AMBER
+
+    # ========================================================
+    # ALARM
+    # ========================================================
+
+    def update_alarm(
+        self,
+        alarm,
+        emergency_stop,
+        fault_code
+    ):
+
+        if emergency_stop:
+
+            bg = RED_DARK
+
+            text = "⚠  EMERGENCY STOP ACTIVE"
+
+        elif fault_code:
+
+            bg = RED_DARK
+
+            text = (
+                "●  FAULT ACTIVE — "
+                + FAULT_CODES.get(
+                    fault_code,
+                    "UNKNOWN"
+                )
+            )
+
+        elif alarm:
+
+            bg = AMBER_DARK
+
+            text = "●  WARNING — PROCESS ALARM ACTIVE"
+
+        else:
+
+            bg = GREEN_DARK
+
+            text = (
+                "●  SYSTEM READY — "
+                "NO ACTIVE ALARMS"
+            )
+
+        self.alarm_banner.config(
+            bg=bg
+        )
+
+        self.alarm_text.config(
+            bg=bg,
+            text=text
+        )
+
+    # ========================================================
+    # STATUS BITS
+    # ========================================================
+
+    def update_status_bits(
+        self,
+        status_word
+    ):
+
+        for bit, _name in STATUS_BITS:
 
             active = bool(
-                status_word
-                & (1 << bit)
+                status_word & (1 << bit)
             )
 
-            variable = self.status_bit_vars[
+            self.status_bit_labels[
                 bit
-            ]
-
-            variable.set(
-                "ON"
-                if active
-                else "OFF"
+            ].config(
+                fg=GREEN if active else "#475569"
             )
-
-            label = getattr(
-                variable,
-                "_label",
-                None,
-            )
-
-            if label is not None:
-
-                label.configure(
-                    fg=(
-                        "#3fb950"
-                        if active
-                        else "#f85149"
-                    )
-                )
-
-        # ----------------------------------------------------
-        # REGISTER TABLE
-        # ----------------------------------------------------
-
-        self.update_register_table(
-            registers
-        )
 
     # ========================================================
     # REGISTER TABLE
@@ -1725,397 +2112,601 @@ class PLC_HMI:
 
     def update_register_table(
         self,
-        registers: list[int],
-    ) -> None:
+        data,
+        speed,
+        actual_rpm,
+        current,
+        pressure_setpoint,
+        pressure,
+        temperature,
+        runtime
+    ):
 
-        for address in range(
-            min(
-                REGISTER_COUNT,
-                len(registers),
+        values = {
+
+            "MOTOR_COMMAND": (
+                data[0],
+                "START" if data[0] else "STOP"
+            ),
+
+            "MODE": (
+                data[1],
+                "AUTO" if data[1] else "MANUAL"
+            ),
+
+            "SPEED_SETPOINT": (
+                speed,
+                f"{speed} RPM"
+            ),
+
+            "ACTUAL_RPM": (
+                actual_rpm,
+                f"{actual_rpm} RPM"
+            ),
+
+            "CURRENT": (
+                self.read_uint32(data, 6),
+                f"{current:.1f} A"
+            ),
+
+            "PRESSURE_SETPOINT": (
+                self.read_uint32(data, 8),
+                f"{pressure_setpoint:.1f} bar"
+            ),
+
+            "ACTUAL_PRESSURE": (
+                self.read_uint32(data, 10),
+                f"{pressure:.1f} bar"
+            ),
+
+            "TEMPERATURE": (
+                self.read_uint32(data, 12),
+                f"{temperature:.1f} °C"
+            ),
+
+            "ALARM": (
+                data[14],
+                "ACTIVE" if data[14] else "NORMAL"
+            ),
+
+            "EMERGENCY_STOP": (
+                data[15],
+                "ACTIVE" if data[15] else "RELEASED"
+            ),
+
+            "HEARTBEAT": (
+                data[16],
+                str(data[16])
+            ),
+
+            "STATUS_WORD": (
+                data[17],
+                f"0x{data[17]:04X}"
+            ),
+
+            "FAULT_CODE": (
+                data[18],
+                FAULT_CODES.get(
+                    data[18],
+                    f"UNKNOWN ({data[18]})"
+                )
+            ),
+
+            "RUNTIME_SECONDS": (
+                runtime,
+                f"{runtime:,} s"
+            ),
+        }
+
+        for name, pair in values.items():
+
+            item = self.register_rows.get(
+                name
             )
-        ):
 
-            value = registers[
-                address
-            ]
+            if item is None:
+                continue
+
+            old_values = self.register_tree.item(
+                item,
+                "values"
+            )
+
+            address = old_values[0]
 
             self.register_tree.item(
-                str(address),
+                item,
                 values=(
                     address,
-                    REGISTER_NAMES.get(
-                        address,
-                        "UNKNOWN",
-                    ),
-                    value,
-                    f"0x{value:04X}",
-                ),
+                    name,
+                    pair[0],
+                    pair[1]
+                )
             )
 
     # ========================================================
-    # WRITE REGISTER
+    # TRENDS
+    # ========================================================
+
+    def draw_trends(self):
+
+        if not hasattr(
+            self,
+            "canvas"
+        ):
+            return
+
+        self.canvas.delete(
+            "all"
+        )
+
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+
+        if width < 100 or height < 100:
+            return
+
+        left = 60
+        right = 25
+        top = 35
+        bottom = 40
+
+        chart_width = (
+            width - left - right
+        )
+
+        chart_height = (
+            height - top - bottom
+        )
+
+        for i in range(6):
+
+            y = (
+                top
+                + chart_height * i / 5
+            )
+
+            self.canvas.create_line(
+                left,
+                y,
+                width - right,
+                y,
+                fill=BORDER
+            )
+
+            rpm_value = (
+                MAX_RPM
+                * (1 - i / 5)
+            )
+
+            self.canvas.create_text(
+                left - 10,
+                y,
+                text=str(
+                    int(rpm_value)
+                ),
+                fill=MUTED,
+                anchor="e",
+                font=("Consolas", 8)
+            )
+
+        self.draw_series(
+            list(self.rpm_history),
+            left,
+            top,
+            chart_width,
+            chart_height,
+            MAX_RPM,
+            BLUE
+        )
+
+        self.draw_series(
+            list(self.pressure_history),
+            left,
+            top,
+            chart_width,
+            chart_height,
+            MAX_PRESSURE,
+            GREEN
+        )
+
+        self.draw_series(
+            list(self.temperature_history),
+            left,
+            top,
+            chart_width,
+            chart_height,
+            MAX_TEMPERATURE,
+            AMBER
+        )
+
+        legend = [
+            ("RPM", BLUE),
+            ("PRESSURE", GREEN),
+            ("TEMPERATURE", AMBER),
+        ]
+
+        x = left
+
+        for name, color in legend:
+
+            self.canvas.create_line(
+                x,
+                height - 18,
+                x + 18,
+                height - 18,
+                fill=color,
+                width=3
+            )
+
+            self.canvas.create_text(
+                x + 25,
+                height - 18,
+                text=name,
+                fill=MUTED,
+                anchor="w",
+                font=("Segoe UI", 8)
+            )
+
+            x += 110
+
+    def draw_series(
+        self,
+        values,
+        x,
+        y,
+        width,
+        height,
+        maximum,
+        color
+    ):
+
+        if len(values) < 2:
+            return
+
+        points = []
+
+        for i, value in enumerate(values):
+
+            px = (
+                x
+                + width
+                * i
+                / max(
+                    len(values) - 1,
+                    1
+                )
+            )
+
+            normalized = min(
+                max(
+                    value / maximum,
+                    0
+                ),
+                1
+            )
+
+            py = (
+                y
+                + height
+                * (1 - normalized)
+            )
+
+            points.extend(
+                [px, py]
+            )
+
+        self.canvas.create_line(
+            *points,
+            fill=color,
+            width=2,
+            smooth=True
+        )
+
+    # ========================================================
+    # COMMANDS
     # ========================================================
 
     def write_register(
         self,
-        address: int,
-        value: int,
-    ) -> bool:
+        address,
+        value
+    ):
 
-        if not self.connect():
-
-            messagebox.showerror(
-                "Connection Error",
-                "PLC server'a bağlanılamadı.",
-            )
-
-            return False
-
-        try:
-
-            result = self.client.write_register(
-                address=address,
-                value=value & 0xFFFF,
-                device_id=UNIT_ID,
-            )
-
-            if result.isError():
-
-                messagebox.showerror(
-                    "Modbus Error",
-                    str(result),
-                )
-
-                return False
-
-            return True
-
-        except Exception as exc:
-
-            messagebox.showerror(
-                "Write Error",
-                str(exc),
-            )
-
-            return False
-
-    # ========================================================
-    # WRITE UINT32
-    # ========================================================
-
-    def write_uint32(
-        self,
-        high_address: int,
-        value: int,
-    ) -> bool:
-
-        if not self.connect():
-
-            messagebox.showerror(
-                "Connection Error",
-                "PLC server'a bağlanılamadı.",
-            )
-
-            return False
-
-        if (
-            value < 0
-            or value > 0xFFFFFFFF
-        ):
-
-            messagebox.showerror(
-                "Invalid Value",
-                "UINT32 değeri 0 ile "
-                "4294967295 arasında olmalı.",
-            )
-
-            return False
-
-        high = (
-            value >> 16
-        ) & 0xFFFF
-
-        low = (
+        success = self.modbus.write_register(
+            address,
             value
-            & 0xFFFF
         )
+
+        if success:
+
+            self.set_connection_status(
+                True
+            )
+
+            self.footer_status.config(
+                text=(
+                    f"Command sent — "
+                    f"Register {40001 + address} = {value}"
+                )
+            )
+
+        else:
+
+            self.set_connection_status(
+                False
+            )
+
+            self.footer_status.config(
+                text="PLC connection unavailable"
+            )
+
+            messagebox.showerror(
+                "Modbus Error",
+                (
+                    "PLC'ye bağlanılamadı.\n\n"
+                    f"Target: {PLC_IP}:{PLC_PORT}\n"
+                    f"Register: {40001 + address}\n"
+                    f"Value: {value}"
+                )
+            )
+
+    # ========================================================
+    # APPLY SETPOINTS
+    # ========================================================
+
+    def apply_setpoints(self):
 
         try:
 
-            result = self.client.write_registers(
-                address=high_address,
-                values=[
-                    high,
-                    low,
-                ],
-                device_id=UNIT_ID,
-            )
+            speed_text = self.rpm_entry.get().strip()
 
-            if result.isError():
+            pressure_text = self.pressure_entry.get().strip()
 
-                messagebox.showerror(
-                    "Modbus Error",
-                    str(result),
+            if not speed_text:
+
+                self.show_message(
+                    "Speed RPM değeri boş bırakılamaz."
                 )
 
-                return False
+                self.rpm_entry.focus_set()
 
-            return True
+                return
 
-        except Exception as exc:
+            if not pressure_text:
 
-            messagebox.showerror(
-                "Write Error",
-                str(exc),
+                self.show_message(
+                    "Pressure bar değeri boş bırakılamaz."
+                )
+
+                self.pressure_entry.focus_set()
+
+                return
+
+            speed = int(speed_text)
+
+            pressure = float(
+                pressure_text.replace(",", ".")
             )
 
-            return False
+            if speed < 0 or speed > MAX_RPM:
 
-    # ========================================================
-    # MOTOR COMMANDS
-    # ========================================================
+                self.show_message(
+                    f"Speed RPM 0 ile {MAX_RPM} "
+                    f"arasında olmalıdır."
+                )
 
-    def start_motor(self):
+                self.rpm_entry.focus_set()
 
-        if self.write_register(
-            MOTOR_COMMAND,
-            1,
-        ):
+                return
 
-            self.show_info(
-                "Motor",
-                "START komutu PLC'ye gönderildi.",
+            if pressure < 0 or pressure > MAX_PRESSURE:
+
+                self.show_message(
+                    f"Pressure 0 ile "
+                    f"{MAX_PRESSURE:.1f} bar "
+                    f"arasında olmalıdır."
+                )
+
+                self.pressure_entry.focus_set()
+
+                return
+
+            # ------------------------------------------------
+            # Pressure PLC'de x10 ölçekli tutuluyor.
+            # ------------------------------------------------
+
+            pressure_scaled = int(
+                round(
+                    pressure * 10
+                )
             )
 
-    def stop_motor(self):
-
-        if self.write_register(
-            MOTOR_COMMAND,
-            0,
-        ):
-
-            self.show_info(
-                "Motor",
-                "STOP komutu PLC'ye gönderildi.",
+            print(
+                f"[HMI] Applying setpoints | "
+                f"SPEED={speed} RPM | "
+                f"PRESSURE={pressure:.1f} bar"
             )
 
-    # ========================================================
-    # MODE
-    # ========================================================
+            # ------------------------------------------------
+            # SPEED
+            # ------------------------------------------------
 
-    def set_auto(self):
-
-        if self.write_register(
-            MODE,
-            1,
-        ):
-
-            self.show_info(
-                "Mode",
-                "AUTO modu seçildi.",
+            speed_ok = self.modbus.write_uint32(
+                REG["SPEED_SETPOINT"],
+                speed
             )
 
-    def set_manual(self):
+            if not speed_ok:
 
-        if self.write_register(
-            MODE,
-            0,
-        ):
+                self.show_message(
+                    "Speed RPM PLC'ye yazılamadı."
+                )
 
-            self.show_info(
-                "Mode",
-                "MANUAL modu seçildi.",
+                return
+
+            # ------------------------------------------------
+            # PRESSURE
+            # ------------------------------------------------
+
+            pressure_ok = self.modbus.write_uint32(
+                REG["PRESSURE_SETPOINT"],
+                pressure_scaled
             )
 
-    # ========================================================
-    # EMERGENCY STOP
-    # ========================================================
+            if not pressure_ok:
 
-    def emergency_stop(self):
+                self.show_message(
+                    "Pressure bar PLC'ye yazılamadı."
+                )
 
-        confirmed = messagebox.askyesno(
-            "EMERGENCY STOP",
-            "Emergency Stop aktif edilsin mi?\n\n"
-            "Motor durdurulacaktır.",
-            icon="warning",
-        )
+                return
 
-        if not confirmed:
-            return
-
-        if self.write_register(
-            EMERGENCY_STOP,
-            1,
-        ):
-
-            messagebox.showwarning(
-                "EMERGENCY STOP",
-                "Emergency Stop aktif edildi.",
+            print(
+                f"[HMI] SETPOINTS APPLIED | "
+                f"SPEED={speed} RPM | "
+                f"PRESSURE={pressure:.1f} bar"
             )
 
-    # ========================================================
-    # RESET EMERGENCY STOP
-    # ========================================================
+            # ------------------------------------------------
+            # Keep written values in UI.
+            # ------------------------------------------------
 
-    def reset_emergency_stop(self):
-
-        confirmed = messagebox.askyesno(
-            "RESET E-STOP",
-            "Emergency Stop resetlensin mi?\n\n"
-            "Motor otomatik olarak başlamayacaktır.\n"
-            "Gerekirse ayrıca START komutu verilmelidir.",
-        )
-
-        if not confirmed:
-            return
-
-        if self.write_register(
-            EMERGENCY_STOP,
-            0,
-        ):
-
-            self.show_info(
-                "E-STOP RESET",
-                "Emergency Stop resetlendi.\n"
-                "Motor yeniden başlatılmak için START bekliyor.",
+            self.update_entry(
+                self.rpm_entry,
+                str(speed),
+                force=True
             )
 
-    # ========================================================
-    # SETPOINTS
-    # ========================================================
+            self.update_entry(
+                self.pressure_entry,
+                f"{pressure:.1f}",
+                force=True
+            )
 
-    def write_rpm(self):
+            self.footer_status.config(
+                text=(
+                    f"Setpoints applied | "
+                    f"Speed {speed} RPM | "
+                    f"Pressure {pressure:.1f} bar"
+                )
+            )
 
-        try:
-
-            value = int(
-                self.rpm_entry_var.get()
+            self.show_message(
+                f"Setpoints applied successfully:\n"
+                f"{speed} RPM / {pressure:.1f} bar"
             )
 
         except ValueError:
 
-            messagebox.showerror(
-                "Invalid RPM",
-                "RPM değeri tam sayı olmalı.",
+            self.show_message(
+                "Geçersiz değer. Speed için tam sayı, "
+                "pressure için sayısal değer girin."
             )
 
-            return
+        except Exception as e:
 
-        if value < 0 or value > 3000:
-
-            messagebox.showerror(
-                "Invalid RPM",
-                "RPM 0-3000 arasında olmalı.",
+            print(
+                f"[HMI] Apply setpoints error: {e}"
             )
 
-            return
-
-        if self.write_uint32(
-            SPEED_SETPOINT_HI,
-            value,
-        ):
-
-            self.show_info(
-                "RPM",
-                f"RPM setpoint {value} olarak yazıldı.",
-            )
-
-    def write_pressure(self):
-
-        try:
-
-            value = float(
-                self.pressure_entry_var.get()
-            )
-
-        except ValueError:
-
-            messagebox.showerror(
-                "Invalid Pressure",
-                "Pressure değeri sayı olmalı.",
-            )
-
-            return
-
-        if value < 0 or value > 10:
-
-            messagebox.showerror(
-                "Invalid Pressure",
-                "Pressure 0-10 bar arasında olmalı.",
-            )
-
-            return
-
-        raw = int(
-            value * 10
-        )
-
-        if self.write_uint32(
-            PRESSURE_SETPOINT_HI,
-            raw,
-        ):
-
-            self.show_info(
-                "Pressure",
-                f"Pressure setpoint "
-                f"{value:.1f} bar olarak yazıldı.",
+            self.show_message(
+                f"Setpoints uygulanamadı:\n{e}"
             )
 
     # ========================================================
-    # MESSAGE HELPER
+    # HELPERS
     # ========================================================
 
-    def show_info(
+    def update_entry(
         self,
-        title: str,
-        message: str,
-    ) -> None:
+        entry,
+        value,
+        force=False
+    ):
 
-        # Normal çalışma sırasında sürekli popup
-        # çıkmaması için kısa bir status mesajı.
-        self.connection_detail_var.set(
-            f"{PLC_IP}:{PLC_PORT} | {message}"
+        # ----------------------------------------------------
+        # CRITICAL FIX:
+        #
+        # If the user is currently typing in this field,
+        # polling must NOT overwrite the field.
+        #
+        # "force=True" is used after APPLY SETPOINTS so the
+        # successfully written value can be displayed.
+        # ----------------------------------------------------
+
+        if not force:
+
+            try:
+
+                if self.root.focus_get() == entry:
+
+                    return
+
+            except Exception:
+
+                pass
+
+        if entry.get() == value:
+
+            return
+
+        entry.delete(
+            0,
+            tk.END
+        )
+
+        entry.insert(
+            0,
+            value
+        )
+
+    def show_message(self, message):
+
+        messagebox.showinfo(
+            "Smart PLC Control Center",
+            message
+        )
+
+    def update_clock(self):
+
+        if not self.running:
+            return
+
+        self.clock_label.config(
+            text=datetime.now().strftime(
+                "%H:%M:%S"
+            )
         )
 
         self.root.after(
-            2500,
-            lambda: self.connection_detail_var.set(
-                f"{PLC_IP}:{PLC_PORT}"
-            ),
+            1000,
+            self.update_clock
         )
 
     # ========================================================
     # CLOSE
     # ========================================================
 
-    def on_close(self):
+    def close(self):
 
-        try:
+        self.running = False
 
-            self.client.close()
-
-        except Exception:
-
-            pass
+        self.modbus.disconnect()
 
         self.root.destroy()
 
 
 # ============================================================
-# MAIN
+# ENTRY POINT
 # ============================================================
 
-def main():
+if __name__ == "__main__":
 
     root = tk.Tk()
 
-    app = PLC_HMI(
+    app = PLCMonitor(
         root
     )
 
     root.mainloop()
-
-
-if __name__ == "__main__":
-
-    main()

@@ -1,29 +1,10 @@
-"""
-0	40001	MOTOR_COMMAND	Motor calistir/durdur komutu	0=STOP, 1=START
-1	40002	MODE	calisma modu	0=MANUAL, 1=AUTO
-2-3	40003-40004	SPEED_SETPOINT	Motor hedef devri	UINT32, RPM
-4-5	40005-40006	ACTUAL_RPM	Gerçek motor devri	UINT32, RPM
-6-7	40007-40008	CURRENT	Motor akimi	UINT32,
-8-9	40009-40010	PRESSURE_SETPOINT	Hedef basinc	UINT32, 
-10-11	40011-40012	ACTUAL_PRESSURE	Gerçek basinc	UINT32, 
-12-13	40013-40014	TEMPERATURE	Motor/sistem sicakliği	UINT32,
-14	40015	ALARM	Alarm durumu	0=Normal, 1=Alarm
-15	40016	EMERGENCY_STOP	Acil durdurma	0=Serbest, 1=Aktif
-16	40017	HEARTBEAT	PLC yaşam sinyali	UINT16, sürekli artar
-17	40018	STATUS_WORD	PLC/motor durum bitleri	UINT16, bit field
-18	40019	FAULT_CODE	Hata kodu	UINT16
-19-20	40020-40021	RUNTIME_SECONDS	Motor calisma süresi
-"""
-
 from __future__ import annotations
 
 import asyncio
 import logging
-import signal
-
 from dataclasses import dataclass
 from enum import IntEnum, IntFlag
-from threading import Lock
+from typing import Optional
 
 from pymodbus.server import ModbusTcpServer
 from pymodbus.simulator import DataType, SimData, SimDevice
@@ -35,27 +16,44 @@ from pymodbus.simulator import DataType, SimData, SimDevice
 
 @dataclass(frozen=True)
 class AppConfig:
-    """Application configuration."""
+    """Central PLC simulator configuration."""
 
     ip: str = "127.0.0.1"
     port: int = 5020
     unit_id: int = 1
 
+    # PLC scan cycle
     scan_time_s: float = 0.5
 
+    # Motor
     max_rpm: int = 3000
     acceleration_rpm_per_scan: int = 100
     deceleration_rpm_per_scan: int = 150
 
+    # Process limits
     max_pressure_bar: float = 10.0
     max_temperature_c: float = 100.0
     max_current_a: float = 30.0
 
+    # Alarm thresholds
+    warning_pressure_bar: float = 8.5
+    warning_temperature_c: float = 70.0
+    warning_current_a: float = 24.0
+
+    # Scaling
     pressure_scale: int = 10
     current_scale: int = 10
     temperature_scale: int = 10
 
-    watchdog_timeout_s: float = 5.0
+    # Process dynamics
+    ambient_temperature_c: float = 25.0
+    temperature_rise_per_rpm: float = 0.012
+    temperature_cooling_factor: float = 0.08
+
+    pressure_response_factor: float = 0.20
+
+    # Logging
+    state_log_interval_s: float = 10.0
 
 
 CONFIG = AppConfig()
@@ -70,7 +68,7 @@ logging.basicConfig(
     format=(
         "%(asctime)s | "
         "%(levelname)-8s | "
-        "%(name)-12s | "
+        "%(name)-16s | "
         "%(message)s"
     ),
 )
@@ -86,12 +84,15 @@ class HR(IntEnum):
     """
     Holding Register map.
 
-    These are ZERO-BASED Modbus addresses.
+    Zero-based Modbus addresses.
 
     Example:
+
         HR.MOTOR_COMMAND = 0
-        This corresponds to Holding Register 40001
-        in the usual 4xxxx notation.
+
+    corresponds to:
+
+        Holding Register 40001
     """
 
     MOTOR_COMMAND = 0
@@ -143,6 +144,14 @@ class OperationMode(IntEnum):
     AUTO = 1
 
 
+class MotorState(IntEnum):
+    STOPPED = 0
+    STARTING = 1
+    RUNNING = 2
+    STOPPING = 3
+    FAULT = 4
+
+
 class FaultCode(IntEnum):
     NONE = 0
     EMERGENCY_STOP = 1
@@ -157,8 +166,10 @@ class FaultCode(IntEnum):
 class StatusBits(IntFlag):
     STOPPED = 1 << 0
     RUNNING = 1 << 1
+
     AUTO_MODE = 1 << 2
     MANUAL_MODE = 1 << 3
+
     ALARM_ACTIVE = 1 << 4
     EMERGENCY_STOP = 1 << 5
     FAULT_ACTIVE = 1 << 6
@@ -171,54 +182,31 @@ class StatusBits(IntFlag):
 
 INITIAL_VALUES = [0] * REGISTER_COUNT
 
-# Motor command = STOP
+# Motor
 INITIAL_VALUES[HR.MOTOR_COMMAND] = MotorCommand.STOP
 
-# Mode = MANUAL
+# Mode
 INITIAL_VALUES[HR.MODE] = OperationMode.MANUAL
 
-# Speed setpoint = 0
+# Speed setpoint
 INITIAL_VALUES[HR.SPEED_SETPOINT_HI] = 0
 INITIAL_VALUES[HR.SPEED_SETPOINT_LO] = 0
 
 # Pressure setpoint = 5.0 bar
-# 5.0 * 10 = 50
 INITIAL_VALUES[HR.PRESSURE_SETPOINT_HI] = 0
 INITIAL_VALUES[HR.PRESSURE_SETPOINT_LO] = 50
 
 # Emergency stop released
 INITIAL_VALUES[HR.EMERGENCY_STOP] = 0
 
+# Temperature starts at ambient = 25.0 C
+INITIAL_VALUES[HR.TEMPERATURE_HI] = 0
+INITIAL_VALUES[HR.TEMPERATURE_LO] = 250
+
 
 # ============================================================
-# PYMODBUS 3.13.1 SIMULATOR DATASTORE
+# PYMODBUS SIMULATOR DATASTORE
 # ============================================================
-
-# IMPORTANT:
-#
-# SimData defines the actual Modbus register range.
-#
-# address=0
-# count=21
-#
-# means:
-#
-#   Modbus address 0  -> 40001
-#   Modbus address 1  -> 40002
-#   ...
-#   Modbus address 20 -> 40021
-#
-# We intentionally use ONE shared register block.
-#
-# Do NOT create:
-#
-#   []
-#   []
-#   [holding registers]
-#   []
-#
-# because SimDevice validates those blocks and an empty block
-# causes the "IndexError: list index out of range" error.
 
 simdata = SimData(
     address=0,
@@ -240,28 +228,20 @@ device = SimDevice(
 
 class RegisterDatabase:
     """
-    Thread-safe interface to the REAL PyModbus server datastore.
+    Thread-safe abstraction over the real PyModbus datastore.
 
-    IMPORTANT:
-        We do NOT keep a second register array here.
+    The Modbus datastore remains the single source of truth.
 
-    The source of truth is the ModbusTcpServer datastore itself.
-
-    This means:
-
-        Modbus Poll
-              |
-              v
-        PyModbus datastore
-              |
-              v
-        RegisterDatabase
-              |
-              v
-        PLC logic
-
-    Therefore a value written by Modbus Poll is immediately visible
-    to the PLC scan cycle.
+    Modbus Poll
+          |
+          v
+    PyModbus datastore
+          |
+          v
+    RegisterDatabase
+          |
+          v
+    PLC logic
     """
 
     HOLDING_REGISTER_FUNCTION = 3
@@ -271,11 +251,8 @@ class RegisterDatabase:
         server: ModbusTcpServer,
         device_id: int,
     ) -> None:
-
         self.server = server
         self.device_id = device_id
-
-        self._lock = Lock()
 
     async def read(
         self,
@@ -289,6 +266,12 @@ class RegisterDatabase:
         if count <= 0:
             raise ValueError("count must be > 0")
 
+        if address + count > REGISTER_COUNT:
+            raise ValueError(
+                f"register range exceeds datastore: "
+                f"address={address}, count={count}"
+            )
+
         values = await self.server.async_getValues(
             self.device_id,
             self.HOLDING_REGISTER_FUNCTION,
@@ -296,7 +279,10 @@ class RegisterDatabase:
             count=count,
         )
 
-        return [int(value) & 0xFFFF for value in values]
+        return [
+            int(value) & 0xFFFF
+            for value in values
+        ]
 
     async def write(
         self,
@@ -307,7 +293,17 @@ class RegisterDatabase:
         if address < 0:
             raise ValueError("address must be >= 0")
 
-        values = [
+        if not values:
+            raise ValueError("values cannot be empty")
+
+        if address + len(values) > REGISTER_COUNT:
+            raise ValueError(
+                f"register range exceeds datastore: "
+                f"address={address}, "
+                f"count={len(values)}"
+            )
+
+        sanitized_values = [
             int(value) & 0xFFFF
             for value in values
         ]
@@ -316,7 +312,7 @@ class RegisterDatabase:
             self.device_id,
             self.HOLDING_REGISTER_FUNCTION,
             address,
-            values,
+            sanitized_values,
         )
 
     async def read_one(
@@ -389,15 +385,24 @@ class ProcessState:
     actual_rpm: int = 0
 
     current_a: float = 0.0
+
     pressure_bar: float = 0.0
+
     temperature_c: float = 25.0
 
     alarm: bool = False
+
     fault_code: FaultCode = FaultCode.NONE
+
+    motor_state: MotorState = MotorState.STOPPED
 
     runtime_seconds: float = 0.0
 
     heartbeat: int = 0
+
+    scan_cycles: int = 0
+
+    last_state_log_time: float = 0.0
 
 
 # ============================================================
@@ -408,14 +413,23 @@ class PLCSimulator:
     """
     Industrial-style PLC process simulator.
 
-    Separates:
+    Execution pipeline:
 
-        - command reading
-        - validation
-        - motor simulation
-        - process simulation
-        - protection
-        - register publishing
+        READ INPUTS
+             ↓
+        VALIDATE
+             ↓
+        PROTECTION
+             ↓
+        MOTOR STATE MACHINE
+             ↓
+        PROCESS MODEL
+             ↓
+        ALARM / FAULT
+             ↓
+        REGISTER PUBLISH
+             ↓
+        LOGGING
     """
 
     def __init__(
@@ -435,7 +449,9 @@ class PLCSimulator:
             "PLC.Simulator"
         )
 
-        self._last_commands: dict | None = None
+        self._last_commands: Optional[dict] = None
+        self._last_fault = FaultCode.NONE
+        self._last_motor_state = MotorState.STOPPED
 
     # ========================================================
     # COMMAND READ
@@ -470,15 +486,13 @@ class PLCSimulator:
             / self.config.pressure_scale
         )
 
-        commands = {
+        return {
             "motor_command": motor_command,
             "mode": mode,
             "emergency_stop": emergency_stop,
             "speed_setpoint": speed_setpoint,
             "pressure_setpoint": pressure_setpoint,
         }
-
-        return commands
 
     # ========================================================
     # INPUT VALIDATION
@@ -490,7 +504,29 @@ class PLCSimulator:
     ) -> FaultCode:
 
         speed = commands["speed_setpoint"]
+
         pressure = commands["pressure_setpoint"]
+
+        motor_command = commands["motor_command"]
+
+        mode = commands["mode"]
+
+        emergency_stop = commands["emergency_stop"]
+
+        if motor_command not in (
+            MotorCommand.STOP,
+            MotorCommand.START,
+        ):
+            return FaultCode.INVALID_SETPOINT
+
+        if mode not in (
+            OperationMode.MANUAL,
+            OperationMode.AUTO,
+        ):
+            return FaultCode.INVALID_SETPOINT
+
+        if emergency_stop not in (0, 1):
+            return FaultCode.INVALID_SETPOINT
 
         if speed > self.config.max_rpm:
             return FaultCode.OVER_SPEED
@@ -498,22 +534,81 @@ class PLCSimulator:
         if pressure > self.config.max_pressure_bar:
             return FaultCode.OVER_PRESSURE
 
-        if commands["motor_command"] not in (
-            MotorCommand.STOP,
-            MotorCommand.START,
-        ):
-            return FaultCode.INVALID_SETPOINT
+        return FaultCode.NONE
 
-        if commands["mode"] not in (
-            OperationMode.MANUAL,
-            OperationMode.AUTO,
+    # ========================================================
+    # PROTECTION
+    # ========================================================
+
+    def determine_fault(
+        self,
+        commands: dict,
+        validation_fault: FaultCode,
+    ) -> FaultCode:
+
+        if commands["emergency_stop"] == 1:
+            return FaultCode.EMERGENCY_STOP
+
+        if validation_fault != FaultCode.NONE:
+            return validation_fault
+
+        if (
+            self.state.temperature_c
+            >= self.config.max_temperature_c
         ):
-            return FaultCode.INVALID_SETPOINT
+            return FaultCode.OVER_TEMPERATURE
+
+        if (
+            self.state.actual_rpm
+            > self.config.max_rpm
+        ):
+            return FaultCode.OVER_SPEED
+
+        if (
+            self.state.current_a
+            > self.config.max_current_a
+        ):
+            return FaultCode.OVER_CURRENT
+
+        if (
+            self.state.pressure_bar
+            > self.config.max_pressure_bar
+        ):
+            return FaultCode.OVER_PRESSURE
 
         return FaultCode.NONE
 
     # ========================================================
-    # MOTOR MODEL
+    # ALARM
+    # ========================================================
+
+    def determine_alarm(self) -> bool:
+
+        if self.state.fault_code != FaultCode.NONE:
+            return True
+
+        if (
+            self.state.temperature_c
+            >= self.config.warning_temperature_c
+        ):
+            return True
+
+        if (
+            self.state.current_a
+            >= self.config.warning_current_a
+        ):
+            return True
+
+        if (
+            self.state.pressure_bar
+            >= self.config.warning_pressure_bar
+        ):
+            return True
+
+        return False
+
+    # ========================================================
+    # MOTOR STATE MACHINE
     # ========================================================
 
     def update_motor(
@@ -521,19 +616,29 @@ class PLCSimulator:
         commands: dict,
     ) -> None:
 
-        emergency_stop = commands["emergency_stop"]
         motor_command = commands["motor_command"]
+
         speed_setpoint = commands["speed_setpoint"]
 
-        # Emergency stop
+        emergency_stop = commands["emergency_stop"]
+
+        fault = self.state.fault_code
+
+        # ----------------------------------------------------
+        # EMERGENCY STOP
+        # ----------------------------------------------------
+
         if emergency_stop == 1:
-
+            self.state.motor_state = MotorState.FAULT
             self.state.actual_rpm = 0
-
             return
 
-        # STOP
-        if motor_command == MotorCommand.STOP:
+        # ----------------------------------------------------
+        # ACTIVE FAULT
+        # ----------------------------------------------------
+
+        if fault != FaultCode.NONE:
+            self.state.motor_state = MotorState.FAULT
 
             self.state.actual_rpm = max(
                 0,
@@ -543,10 +648,56 @@ class PLCSimulator:
 
             return
 
-        # START
+        # ----------------------------------------------------
+        # STOP COMMAND
+        # ----------------------------------------------------
+
+        if motor_command == MotorCommand.STOP:
+
+            if self.state.actual_rpm > 0:
+
+                self.state.motor_state = (
+                    MotorState.STOPPING
+                )
+
+                self.state.actual_rpm = max(
+                    0,
+                    self.state.actual_rpm
+                    - self.config.deceleration_rpm_per_scan,
+                )
+
+            else:
+
+                self.state.motor_state = (
+                    MotorState.STOPPED
+                )
+
+            return
+
+        # ----------------------------------------------------
+        # START COMMAND
+        # ----------------------------------------------------
+
         if motor_command == MotorCommand.START:
 
-            if self.state.actual_rpm < speed_setpoint:
+            if speed_setpoint <= 0:
+
+                self.state.motor_state = (
+                    MotorState.STOPPED
+                )
+
+                self.state.actual_rpm = 0
+
+                return
+
+            if (
+                self.state.actual_rpm
+                < speed_setpoint
+            ):
+
+                self.state.motor_state = (
+                    MotorState.STARTING
+                )
 
                 self.state.actual_rpm = min(
                     speed_setpoint,
@@ -554,12 +705,25 @@ class PLCSimulator:
                     + self.config.acceleration_rpm_per_scan,
                 )
 
-            elif self.state.actual_rpm > speed_setpoint:
+            elif (
+                self.state.actual_rpm
+                > speed_setpoint
+            ):
+
+                self.state.motor_state = (
+                    MotorState.STOPPING
+                )
 
                 self.state.actual_rpm = max(
                     speed_setpoint,
                     self.state.actual_rpm
                     - self.config.deceleration_rpm_per_scan,
+                )
+
+            else:
+
+                self.state.motor_state = (
+                    MotorState.RUNNING
                 )
 
     # ========================================================
@@ -587,18 +751,29 @@ class PLCSimulator:
 
         if rpm > 0:
 
+            load_ratio = (
+                rpm / self.config.max_rpm
+            )
+
             current = (
                 2.0
-                + rpm * 0.005
+                + 15.0 * load_ratio
             )
+
+            # Small additional load while accelerating.
+            if self.state.motor_state == MotorState.STARTING:
+                current += 2.0
 
         else:
 
             current = 0.0
 
-        self.state.current_a = min(
-            current,
-            self.config.max_current_a,
+        self.state.current_a = max(
+            0.0,
+            min(
+                current,
+                self.config.max_current_a,
+            ),
         )
 
         # ----------------------------------------------------
@@ -610,90 +785,57 @@ class PLCSimulator:
             and speed_setpoint > 0
         ):
 
-            ratio = (
-                rpm
-                / speed_setpoint
-            )
+            target_pressure = (
+                rpm / speed_setpoint
+            ) * pressure_setpoint
 
-            ratio = max(
+            target_pressure = max(
                 0.0,
-                min(ratio, 1.0),
-            )
-
-            self.state.pressure_bar = (
-                ratio
-                * pressure_setpoint
+                min(
+                    target_pressure,
+                    self.config.max_pressure_bar,
+                ),
             )
 
         else:
 
-            self.state.pressure_bar = 0.0
+            target_pressure = 0.0
+
+        # Smooth pressure response.
+        self.state.pressure_bar += (
+            target_pressure
+            - self.state.pressure_bar
+        ) * self.config.pressure_response_factor
 
         # ----------------------------------------------------
         # TEMPERATURE
         # ----------------------------------------------------
 
-        self.state.temperature_c = (
-            25.0
-            + rpm * 0.01
+        target_temperature = (
+            self.config.ambient_temperature_c
+            + rpm
+            * self.config.temperature_rise_per_rpm
         )
 
-    # ========================================================
-    # PROTECTION
-    # ========================================================
+        # Heating
+        if target_temperature > self.state.temperature_c:
 
-    def update_protection(
-        self,
-        commands: dict,
-        validation_fault: FaultCode,
-    ) -> None:
+            self.state.temperature_c += (
+                target_temperature
+                - self.state.temperature_c
+            ) * 0.15
 
-        fault = FaultCode.NONE
+        # Cooling
+        else:
 
-        emergency_stop = commands[
-            "emergency_stop"
-        ]
+            self.state.temperature_c += (
+                target_temperature
+                - self.state.temperature_c
+            ) * self.config.temperature_cooling_factor
 
-        if emergency_stop == 1:
-
-            fault = FaultCode.EMERGENCY_STOP
-
-        elif validation_fault != FaultCode.NONE:
-
-            fault = validation_fault
-
-        elif (
-            self.state.temperature_c
-            >= self.config.max_temperature_c
-        ):
-
-            fault = FaultCode.OVER_TEMPERATURE
-
-        elif (
-            self.state.actual_rpm
-            > self.config.max_rpm
-        ):
-
-            fault = FaultCode.OVER_SPEED
-
-        elif (
-            self.state.current_a
-            > self.config.max_current_a
-        ):
-
-            fault = FaultCode.OVER_CURRENT
-
-        elif (
-            self.state.pressure_bar
-            > self.config.max_pressure_bar
-        ):
-
-            fault = FaultCode.OVER_PRESSURE
-
-        self.state.fault_code = fault
-
-        self.state.alarm = (
-            fault != FaultCode.NONE
+        self.state.temperature_c = max(
+            self.config.ambient_temperature_c,
+            self.state.temperature_c,
         )
 
     # ========================================================
@@ -707,39 +849,35 @@ class PLCSimulator:
 
         status = StatusBits(0)
 
+        # Motor state
         if self.state.actual_rpm == 0:
-
             status |= StatusBits.STOPPED
-
         else:
-
             status |= StatusBits.RUNNING
 
+        # Mode
         if commands["mode"] == OperationMode.AUTO:
-
             status |= StatusBits.AUTO_MODE
-
         else:
-
             status |= StatusBits.MANUAL_MODE
 
+        # Alarm
         if self.state.alarm:
-
             status |= StatusBits.ALARM_ACTIVE
 
+        # E-stop
         if commands["emergency_stop"] == 1:
-
             status |= StatusBits.EMERGENCY_STOP
 
+        # Fault
         if self.state.fault_code != FaultCode.NONE:
-
             status |= StatusBits.FAULT_ACTIVE
 
+        # Ready
         if (
-            not self.state.alarm
+            self.state.fault_code == FaultCode.NONE
             and commands["emergency_stop"] == 0
         ):
-
             status |= StatusBits.READY
 
         return int(status)
@@ -874,9 +1012,7 @@ class PLCSimulator:
 
         if self._last_commands is None:
 
-            self._last_commands = dict(
-                commands
-            )
+            self._last_commands = dict(commands)
 
             self.logger.info(
                 "INITIAL COMMANDS | "
@@ -885,16 +1021,19 @@ class PLCSimulator:
                 "SET_RPM=%d | "
                 "SET_PRESSURE=%.1f bar | "
                 "E_STOP=%d",
+
                 (
                     "START"
                     if commands["motor_command"]
                     else "STOP"
                 ),
+
                 (
                     "AUTO"
                     if commands["mode"]
                     else "MANUAL"
                 ),
+
                 commands["speed_setpoint"],
                 commands["pressure_setpoint"],
                 commands["emergency_stop"],
@@ -905,12 +1044,16 @@ class PLCSimulator:
         changed = (
             commands["motor_command"]
             != self._last_commands["motor_command"]
+
             or commands["mode"]
             != self._last_commands["mode"]
+
             or commands["speed_setpoint"]
             != self._last_commands["speed_setpoint"]
+
             or commands["pressure_setpoint"]
             != self._last_commands["pressure_setpoint"]
+
             or commands["emergency_stop"]
             != self._last_commands["emergency_stop"]
         )
@@ -924,38 +1067,134 @@ class PLCSimulator:
                 "SET_RPM=%d | "
                 "SET_PRESSURE=%.1f bar | "
                 "E_STOP=%d",
+
                 (
                     "START"
                     if commands["motor_command"]
                     else "STOP"
                 ),
+
                 (
                     "AUTO"
                     if commands["mode"]
                     else "MANUAL"
                 ),
+
                 commands["speed_setpoint"],
                 commands["pressure_setpoint"],
                 commands["emergency_stop"],
             )
 
-        self._last_commands = dict(
-            commands
+        self._last_commands = dict(commands)
+
+    # ========================================================
+    # FAULT / STATE MONITOR
+    # ========================================================
+
+    def log_state_changes(self) -> None:
+
+        # Motor state transition
+        if (
+            self.state.motor_state
+            != self._last_motor_state
+        ):
+
+            self.logger.info(
+                "MOTOR STATE | %s -> %s | RPM=%d",
+                self._last_motor_state.name,
+                self.state.motor_state.name,
+                self.state.actual_rpm,
+            )
+
+            self._last_motor_state = (
+                self.state.motor_state
+            )
+
+        # Fault transition
+        if (
+            self.state.fault_code
+            != self._last_fault
+        ):
+
+            if self.state.fault_code == FaultCode.NONE:
+
+                self.logger.info(
+                    "FAULT CLEARED"
+                )
+
+            else:
+
+                self.logger.error(
+                    "FAULT ACTIVE | CODE=%d | NAME=%s",
+                    int(self.state.fault_code),
+                    self.state.fault_code.name,
+                )
+
+            self._last_fault = (
+                self.state.fault_code
+            )
+
+    # ========================================================
+    # PERIODIC STATE MONITOR
+    # ========================================================
+
+    def log_periodic_state(
+        self,
+        commands: dict,
+        current_time: float,
+    ) -> None:
+
+        if (
+            current_time
+            - self.state.last_state_log_time
+            < self.config.state_log_interval_s
+        ):
+            return
+
+        self.state.last_state_log_time = current_time
+
+        self.logger.info(
+            "PLC STATUS | "
+            "STATE=%s | "
+            "RPM=%d/%d | "
+            "CURRENT=%.1f A | "
+            "PRESSURE=%.1f bar | "
+            "TEMP=%.1f C | "
+            "MODE=%s | "
+            "ALARM=%s | "
+            "FAULT=%s | "
+            "RUNTIME=%ds",
+
+            self.state.motor_state.name,
+
+            self.state.actual_rpm,
+            commands["speed_setpoint"],
+
+            self.state.current_a,
+
+            self.state.pressure_bar,
+
+            self.state.temperature_c,
+
+            (
+                "AUTO"
+                if commands["mode"]
+                else "MANUAL"
+            ),
+
+            (
+                "YES"
+                if self.state.alarm
+                else "NO"
+            ),
+
+            self.state.fault_code.name,
+
+            int(self.state.runtime_seconds),
         )
 
     # ========================================================
-    # MONITORING
-    # ========================================================
-
-    def log_state(
-        self,
-        commands: dict,
-    ) -> None:
-        pass
-
-
-    # ========================================================
-    # MAIN PLC LOOP
+    # PLC MAIN LOOP
     # ========================================================
 
     async def run(self) -> None:
@@ -964,19 +1203,32 @@ class PLCSimulator:
             "PLC simulation started."
         )
 
+        self.logger.info(
+            "Scan cycle: %.3f seconds",
+            self.config.scan_time_s,
+        )
+
         while not self.stop_event.is_set():
 
-            cycle_start = asyncio.get_running_loop().time()
+            cycle_start = (
+                asyncio.get_running_loop().time()
+            )
 
             try:
 
-                # Read values written by Modbus Poll.
+                # ------------------------------------------------
+                # 1. READ MODBUS INPUTS
+                # ------------------------------------------------
+
                 commands = await self.read_commands()
 
-                # Show immediately when Modbus Poll changes something.
                 self.log_command_changes(
                     commands
                 )
+
+                # ------------------------------------------------
+                # 2. VALIDATE COMMANDS
+                # ------------------------------------------------
 
                 validation_fault = (
                     self.validate_commands(
@@ -984,32 +1236,96 @@ class PLCSimulator:
                     )
                 )
 
+                # ------------------------------------------------
+                # 3. INITIAL PROTECTION CHECK
+                # ------------------------------------------------
+
+                preliminary_fault = (
+                    self.determine_fault(
+                        commands,
+                        validation_fault,
+                    )
+                )
+
+                # Invalid command or active E-stop
+                # must immediately prevent normal operation.
+                self.state.fault_code = (
+                    preliminary_fault
+                )
+
+                # ------------------------------------------------
+                # 4. MOTOR STATE MACHINE
+                # ------------------------------------------------
+
                 self.update_motor(
                     commands
                 )
+
+                # ------------------------------------------------
+                # 5. PROCESS SIMULATION
+                # ------------------------------------------------
 
                 self.update_process(
                     commands
                 )
 
-                self.update_protection(
-                    commands,
-                    validation_fault,
+                # ------------------------------------------------
+                # 6. FINAL PROTECTION CHECK
+                # ------------------------------------------------
+
+                final_fault = (
+                    self.determine_fault(
+                        commands,
+                        validation_fault,
+                    )
                 )
+
+                self.state.fault_code = (
+                    final_fault
+                )
+
+                # ------------------------------------------------
+                # 7. ALARM
+                # ------------------------------------------------
+
+                self.state.alarm = (
+                    self.determine_alarm()
+                )
+
+                # ------------------------------------------------
+                # 8. PUBLISH TO MODBUS
+                # ------------------------------------------------
 
                 await self.publish(
                     commands
                 )
 
-                self.log_state(
-                    commands
+                # ------------------------------------------------
+                # 9. MONITORING
+                # ------------------------------------------------
+
+                self.log_state_changes()
+
+                current_time = (
+                    asyncio.get_running_loop().time()
                 )
+
+                self.log_periodic_state(
+                    commands,
+                    current_time,
+                )
+
+                self.state.scan_cycles += 1
 
             except Exception:
 
                 self.logger.exception(
                     "PLC scan cycle failed."
                 )
+
+            # ----------------------------------------------------
+            # MAINTAIN FIXED SCAN PERIOD
+            # ----------------------------------------------------
 
             elapsed = (
                 asyncio.get_running_loop().time()
@@ -1030,7 +1346,6 @@ class PLCSimulator:
                 )
 
             except asyncio.TimeoutError:
-
                 pass
 
         self.logger.info(
@@ -1053,7 +1368,7 @@ async def main() -> None:
     )
 
     LOGGER.info(
-        "        PROFESSIONAL MODBUS TCP PLC"
+        "       PROFESSIONAL MODBUS TCP PLC"
     )
 
     LOGGER.info(
@@ -1081,11 +1396,16 @@ async def main() -> None:
     )
 
     LOGGER.info(
+        "REGISTERS: %d",
+        REGISTER_COUNT,
+    )
+
+    LOGGER.info(
         "=================================================="
     )
 
     # --------------------------------------------------------
-    # CREATE REAL MODBUS TCP SERVER
+    # CREATE MODBUS TCP SERVER
     # --------------------------------------------------------
 
     server = ModbusTcpServer(
@@ -1098,9 +1418,6 @@ async def main() -> None:
 
     # --------------------------------------------------------
     # REGISTER DATABASE
-    #
-    # IMPORTANT:
-    # It uses the SAME server datastore that Modbus Poll uses.
     # --------------------------------------------------------
 
     register_db = RegisterDatabase(
@@ -1118,7 +1435,7 @@ async def main() -> None:
     )
 
     # --------------------------------------------------------
-    # START SERVER
+    # START MODBUS SERVER
     # --------------------------------------------------------
 
     LOGGER.info(
@@ -1139,9 +1456,11 @@ async def main() -> None:
 
     try:
 
-        # Wait until one of the tasks exits.
         done, pending = await asyncio.wait(
-            [server_task, plc_task],
+            [
+                server_task,
+                plc_task,
+            ],
             return_when=asyncio.FIRST_EXCEPTION,
         )
 
@@ -1151,9 +1470,13 @@ async def main() -> None:
 
             if exception is not None:
 
-                LOGGER.exception(
+                LOGGER.error(
                     "Application task failed.",
-                    exc_info=exception,
+                    exc_info=(
+                        type(exception),
+                        exception,
+                        exception.__traceback__,
+                    ),
                 )
 
                 raise exception
@@ -1168,9 +1491,16 @@ async def main() -> None:
             "Shutdown signal received."
         )
 
+        # ----------------------------------------------------
+        # STOP PLC
+        # ----------------------------------------------------
+
         plc.stop()
 
-        # Stop Modbus server.
+        # ----------------------------------------------------
+        # STOP MODBUS SERVER
+        # ----------------------------------------------------
+
         try:
 
             await server.shutdown()
@@ -1181,17 +1511,22 @@ async def main() -> None:
                 "Error while shutting down Modbus server."
             )
 
-        # Cancel tasks.
+        # ----------------------------------------------------
+        # CANCEL TASKS
+        # ----------------------------------------------------
+
         for task in (
             server_task,
             plc_task,
         ):
 
             if not task.done():
-
                 task.cancel()
 
-        # Wait for tasks.
+        # ----------------------------------------------------
+        # WAIT FOR TASKS
+        # ----------------------------------------------------
+
         await asyncio.gather(
             server_task,
             plc_task,
