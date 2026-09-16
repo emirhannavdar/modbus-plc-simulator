@@ -13,11 +13,14 @@ from collections import deque
 PLC_IP = "127.0.0.1"
 PLC_PORT = 5020
 UNIT_ID = 1
+
 POLL_INTERVAL_MS = 500
+
 MAX_RPM = 3000
 MAX_PRESSURE = 10.0
 MAX_TEMPERATURE = 100.0
 MAX_CURRENT = 30.0
+
 TREND_POINTS = 120
 
 
@@ -59,6 +62,10 @@ FAULT_CODES = {
 }
 
 
+# ============================================================
+# STATUS BITS
+# ============================================================
+
 STATUS_BITS = [
     (0, "STOPPED"),
     (1, "RUNNING"),
@@ -79,6 +86,7 @@ BG = "#0b1120"
 PANEL = "#111827"
 PANEL_2 = "#172033"
 BORDER = "#263247"
+
 TEXT = "#f1f5f9"
 MUTED = "#94a3b8"
 
@@ -102,7 +110,6 @@ RED_DARK = "#7f1d1d"
 class ModbusManager:
 
     def __init__(self):
-
         self.client = None
         self.lock = threading.Lock()
         self.connected = False
@@ -222,7 +229,11 @@ class ModbusManager:
 
                 return None
 
-    def write_register(self, address, value):
+    def write_register(
+        self,
+        address,
+        value
+    ):
 
         if not self.ensure_connection():
             return False
@@ -264,12 +275,11 @@ class ModbusManager:
 
                 return False
 
-    def write_uint32(self, address, value):
-
-        # ----------------------------------------------------
-        # FIX:
-        # Make sure the connection exists before writing.
-        # ----------------------------------------------------
+    def write_uint32(
+        self,
+        address,
+        value
+    ):
 
         if not self.ensure_connection():
             return False
@@ -317,10 +327,10 @@ class ModbusManager:
 
                 return True
 
-            except Exception as e:
+            except Exception as exc:
 
                 print(
-                    f"[MODBUS] Write UINT32 exception: {e}"
+                    f"[MODBUS] Write UINT32 exception: {exc}"
                 )
 
                 self.connected = False
@@ -360,6 +370,22 @@ class PLCMonitor:
         self.running = True
 
         self.last_data = None
+
+        # ====================================================
+        # ALARM STATE
+        # ====================================================
+
+        self.previous_alarm = False
+        self.previous_fault_code = 0
+        self.previous_emergency_stop = False
+
+        self.alarm_history = deque(
+            maxlen=50
+        )
+
+        # ====================================================
+        # TREND DATA
+        # ====================================================
 
         self.rpm_history = deque(
             maxlen=TREND_POINTS
@@ -603,7 +629,7 @@ class PLCMonitor:
         )
 
     # ========================================================
-    # ALARM
+    # ALARM BANNER
     # ========================================================
 
     def build_alarm_banner(self):
@@ -641,12 +667,100 @@ class PLCMonitor:
 
     def build_overview(self):
 
-        container = tk.Frame(
+        # ====================================================
+        # SCROLLABLE OVERVIEW
+        # ====================================================
+
+        self.overview_canvas = tk.Canvas(
             self.overview_tab,
+            bg=BG,
+            highlightthickness=0
+        )
+
+        scrollbar = ttk.Scrollbar(
+            self.overview_tab,
+            orient="vertical",
+            command=self.overview_canvas.yview
+        )
+
+        self.overview_canvas.configure(
+            yscrollcommand=scrollbar.set
+        )
+
+        scrollbar.pack(
+            side="right",
+            fill="y"
+        )
+
+        self.overview_canvas.pack(
+            side="left",
+            fill="both",
+            expand=True
+        )
+
+        container = tk.Frame(
+            self.overview_canvas,
             bg=BG
         )
 
-        container.pack(
+        canvas_window = self.overview_canvas.create_window(
+            (0, 0),
+            window=container,
+            anchor="nw"
+        )
+
+        def update_scroll_region(event=None):
+
+            self.overview_canvas.configure(
+                scrollregion=self.overview_canvas.bbox("all")
+            )
+
+        def resize_container(event):
+
+            self.overview_canvas.itemconfigure(
+                canvas_window,
+                width=event.width
+            )
+
+        container.bind(
+            "<Configure>",
+            update_scroll_region
+        )
+
+        self.overview_canvas.bind(
+            "<Configure>",
+            resize_container
+        )
+
+        # ====================================================
+        # MOUSE WHEEL
+        # ====================================================
+
+        self.root.bind(
+            "<MouseWheel>",
+            self.on_mousewheel
+        )
+
+        self.root.bind(
+            "<Button-4>",
+            self.on_mousewheel_linux
+        )
+
+        self.root.bind(
+            "<Button-5>",
+            self.on_mousewheel_linux
+        )
+
+        # ====================================================
+        # MAIN CONTENT
+        # ====================================================
+
+        main = tk.Frame(
+            container,
+            bg=BG
+        )
+
+        main.pack(
             fill="both",
             expand=True,
             padx=10,
@@ -654,7 +768,7 @@ class PLCMonitor:
         )
 
         left = tk.Frame(
-            container,
+            main,
             bg=BG
         )
 
@@ -665,7 +779,7 @@ class PLCMonitor:
         )
 
         right = tk.Frame(
-            container,
+            main,
             bg=BG,
             width=370
         )
@@ -687,6 +801,95 @@ class PLCMonitor:
         self.build_control_panel(right)
 
         self.build_status_panel(right)
+
+        self.build_alarm_history(container)
+
+    def on_mousewheel(self, event):
+
+        try:
+
+            widget = self.root.winfo_containing(
+                event.x_root,
+                event.y_root
+            )
+
+            if widget is None:
+                return
+
+            current = widget
+
+            while current is not None:
+
+                if current == self.overview_tab:
+
+                    self.overview_canvas.yview_scroll(
+                        int(-1 * (event.delta / 120)),
+                        "units"
+                    )
+
+                    return
+
+                parent_name = current.winfo_parent()
+
+                if not parent_name:
+                    break
+
+                try:
+                    current = current.nametowidget(
+                        parent_name
+                    )
+                except Exception:
+                    break
+
+        except Exception:
+            pass
+
+    def on_mousewheel_linux(self, event):
+
+        try:
+
+            widget = self.root.winfo_containing(
+                event.x_root,
+                event.y_root
+            )
+
+            if widget is None:
+                return
+
+            current = widget
+
+            while current is not None:
+
+                if current == self.overview_tab:
+
+                    if event.num == 4:
+                        self.overview_canvas.yview_scroll(
+                            -3,
+                            "units"
+                        )
+
+                    elif event.num == 5:
+                        self.overview_canvas.yview_scroll(
+                            3,
+                            "units"
+                        )
+
+                    return
+
+                parent_name = current.winfo_parent()
+
+                if not parent_name:
+                    break
+
+                try:
+                    current = current.nametowidget(
+                        parent_name
+                    )
+                except Exception:
+                    break
+
+        except Exception:
+            pass
 
     # ========================================================
     # PROCESS
@@ -1101,7 +1304,11 @@ class PLCMonitor:
             ipady=5
         )
 
-    def entry_row(self, parent, label):
+    def entry_row(
+        self,
+        parent,
+        label
+    ):
 
         frame = tk.Frame(
             parent,
@@ -1221,6 +1428,198 @@ class PLCMonitor:
             )
 
             self.status_items[name] = label
+
+    # ========================================================
+    # ALARM HISTORY
+    # ========================================================
+
+    def build_alarm_history(self, parent):
+
+        panel = tk.Frame(
+            parent,
+            bg=PANEL,
+            highlightbackground=BORDER,
+            highlightthickness=1
+        )
+
+        panel.pack(
+            fill="x",
+            padx=10,
+            pady=(5, 10)
+        )
+
+        header = tk.Frame(
+            panel,
+            bg=PANEL
+        )
+
+        header.pack(
+            fill="x",
+            padx=18,
+            pady=(15, 8)
+        )
+
+        tk.Label(
+            header,
+            text="ALARM HISTORY",
+            bg=PANEL,
+            fg=TEXT,
+            font=("Segoe UI", 11, "bold")
+        ).pack(
+            side="left"
+        )
+
+        tk.Button(
+            header,
+            text="CLEAR HISTORY",
+            command=self.clear_alarm_history,
+            bg="#334155",
+            fg=TEXT,
+            activebackground="#475569",
+            relief="flat",
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2"
+        ).pack(
+            side="right"
+        )
+
+        frame = tk.Frame(
+            panel,
+            bg=PANEL
+        )
+
+        frame.pack(
+            fill="x",
+            padx=15,
+            pady=(0, 15)
+        )
+
+        columns = (
+            "time",
+            "type",
+            "code",
+            "message"
+        )
+
+        self.alarm_tree = ttk.Treeview(
+            frame,
+            columns=columns,
+            show="headings",
+            height=7
+        )
+
+        self.alarm_tree.heading(
+            "time",
+            text="TIME"
+        )
+
+        self.alarm_tree.heading(
+            "type",
+            text="TYPE"
+        )
+
+        self.alarm_tree.heading(
+            "code",
+            text="CODE"
+        )
+
+        self.alarm_tree.heading(
+            "message",
+            text="MESSAGE"
+        )
+
+        self.alarm_tree.column(
+            "time",
+            width=100,
+            anchor="center"
+        )
+
+        self.alarm_tree.column(
+            "type",
+            width=100,
+            anchor="center"
+        )
+
+        self.alarm_tree.column(
+            "code",
+            width=70,
+            anchor="center"
+        )
+
+        self.alarm_tree.column(
+            "message",
+            width=500
+        )
+
+        alarm_scrollbar = ttk.Scrollbar(
+            frame,
+            orient="vertical",
+            command=self.alarm_tree.yview
+        )
+
+        self.alarm_tree.configure(
+            yscrollcommand=alarm_scrollbar.set
+        )
+
+        self.alarm_tree.pack(
+            side="left",
+            fill="both",
+            expand=True
+        )
+
+        alarm_scrollbar.pack(
+            side="right",
+            fill="y"
+        )
+
+    def add_alarm_history(
+        self,
+        event_type,
+        fault_code,
+        message
+    ):
+
+        timestamp = datetime.now().strftime(
+            "%H:%M:%S"
+        )
+
+        self.alarm_history.append(
+            {
+                "time": timestamp,
+                "type": event_type,
+                "code": fault_code,
+                "message": message
+            }
+        )
+
+        self.alarm_tree.insert(
+            "",
+            0,
+            values=(
+                timestamp,
+                event_type,
+                fault_code,
+                message
+            )
+        )
+
+        items = self.alarm_tree.get_children()
+
+        if len(items) > 50:
+
+            for item in items[50:]:
+                self.alarm_tree.delete(item)
+
+    def clear_alarm_history(self):
+
+        for item in self.alarm_tree.get_children():
+            self.alarm_tree.delete(item)
+
+        self.alarm_history.clear()
+
+        self.footer_status.config(
+            text="Alarm history cleared"
+        )
 
     # ========================================================
     # TRENDS
@@ -1810,9 +2209,9 @@ class PLCMonitor:
             REG["RUNTIME"]
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # VALUES
-        # ----------------------------------------------------
+        # ====================================================
 
         self.rpm_value.config(
             text=f"{actual_rpm:,}"
@@ -1835,9 +2234,9 @@ class PLCMonitor:
             MAX_RPM
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # STATE
-        # ----------------------------------------------------
+        # ====================================================
 
         state = self.get_motor_state(
             actual_rpm,
@@ -1851,9 +2250,9 @@ class PLCMonitor:
             fg=state[1]
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # STATUS
-        # ----------------------------------------------------
+        # ====================================================
 
         self.status_items[
             "MODE"
@@ -1904,9 +2303,9 @@ class PLCMonitor:
             text=f"{runtime:,} s"
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # DIAGNOSTICS
-        # ----------------------------------------------------
+        # ====================================================
 
         self.diagnostic_heartbeat.config(
             text=str(heartbeat)
@@ -1921,9 +2320,9 @@ class PLCMonitor:
             fg=RED if fault_code else GREEN
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # ALARM
-        # ----------------------------------------------------
+        # ====================================================
 
         self.update_alarm(
             alarm,
@@ -1931,9 +2330,9 @@ class PLCMonitor:
             fault_code
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # TRENDS
-        # ----------------------------------------------------
+        # ====================================================
 
         self.rpm_history.append(
             actual_rpm
@@ -1949,9 +2348,9 @@ class PLCMonitor:
 
         self.draw_trends()
 
-        # ----------------------------------------------------
+        # ====================================================
         # REGISTERS
-        # ----------------------------------------------------
+        # ====================================================
 
         self.update_register_table(
             data,
@@ -1964,21 +2363,17 @@ class PLCMonitor:
             runtime
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # STATUS BITS
-        # ----------------------------------------------------
+        # ====================================================
 
         self.update_status_bits(
             status_word
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # SETPOINTS
-        #
-        # IMPORTANT:
-        # Do NOT overwrite the Entry while the user is
-        # currently typing in it.
-        # ----------------------------------------------------
+        # ====================================================
 
         self.update_entry(
             self.rpm_entry,
@@ -1989,6 +2384,10 @@ class PLCMonitor:
             self.pressure_entry,
             f"{pressure_setpoint:.1f}"
         )
+
+        # ====================================================
+        # FOOTER
+        # ====================================================
 
         self.footer_status.config(
             text=(
@@ -2033,7 +2432,7 @@ class PLCMonitor:
         return "STOPPING", AMBER
 
     # ========================================================
-    # ALARM
+    # ALARM SYSTEM
     # ========================================================
 
     def update_alarm(
@@ -2043,11 +2442,22 @@ class PLCMonitor:
         fault_code
     ):
 
+        fault_name = FAULT_CODES.get(
+            fault_code,
+            f"UNKNOWN FAULT ({fault_code})"
+        )
+
+        # ====================================================
+        # VISUAL ALARM STATE
+        # ====================================================
+
         if emergency_stop:
 
             bg = RED_DARK
 
-            text = "⚠  EMERGENCY STOP ACTIVE"
+            text = (
+                "⚠  EMERGENCY STOP ACTIVE"
+            )
 
         elif fault_code:
 
@@ -2055,17 +2465,17 @@ class PLCMonitor:
 
             text = (
                 "●  FAULT ACTIVE — "
-                + FAULT_CODES.get(
-                    fault_code,
-                    "UNKNOWN"
-                )
+                + fault_name
             )
 
         elif alarm:
 
             bg = AMBER_DARK
 
-            text = "●  WARNING — PROCESS ALARM ACTIVE"
+            text = (
+                "●  WARNING — "
+                "PROCESS ALARM ACTIVE"
+            )
 
         else:
 
@@ -2083,6 +2493,148 @@ class PLCMonitor:
         self.alarm_text.config(
             bg=bg,
             text=text
+        )
+
+        # ====================================================
+        # EMERGENCY STOP ACTIVATED
+        # ====================================================
+
+        if (
+            emergency_stop
+            and not self.previous_emergency_stop
+        ):
+
+            self.add_alarm_history(
+                "E-STOP",
+                1,
+                "Emergency stop activated"
+            )
+
+            messagebox.showwarning(
+                "EMERGENCY STOP",
+                (
+                    "⚠ EMERGENCY STOP ACTIVE\n\n"
+                    "The motor has been stopped "
+                    "by the emergency stop signal."
+                ),
+                parent=self.root
+            )
+
+        # ====================================================
+        # EMERGENCY STOP RELEASED
+        # ====================================================
+
+        elif (
+            not emergency_stop
+            and self.previous_emergency_stop
+        ):
+
+            self.add_alarm_history(
+                "CLEARED",
+                0,
+                "Emergency stop released"
+            )
+
+        # ====================================================
+        # NEW FAULT
+        # ====================================================
+
+        if (
+            fault_code
+            and fault_code != self.previous_fault_code
+            and not emergency_stop
+        ):
+
+            self.add_alarm_history(
+                "FAULT",
+                fault_code,
+                fault_name
+            )
+
+            messagebox.showwarning(
+                "PLC FAULT",
+                (
+                    "⚠ PLC FAULT DETECTED\n\n"
+                    f"Fault: {fault_name}\n"
+                    f"Fault Code: {fault_code}"
+                ),
+                parent=self.root
+            )
+
+        # ====================================================
+        # FAULT CLEARED
+        # ====================================================
+
+        elif (
+            fault_code == 0
+            and self.previous_fault_code != 0
+        ):
+
+            previous_fault_name = FAULT_CODES.get(
+                self.previous_fault_code,
+                "UNKNOWN"
+            )
+
+            self.add_alarm_history(
+                "CLEARED",
+                self.previous_fault_code,
+                f"Fault cleared: {previous_fault_name}"
+            )
+
+        # ====================================================
+        # PROCESS ALARM ACTIVATED
+        # ====================================================
+
+        if (
+            alarm
+            and not self.previous_alarm
+            and not fault_code
+            and not emergency_stop
+        ):
+
+            self.add_alarm_history(
+                "WARNING",
+                0,
+                "Process alarm became active"
+            )
+
+            messagebox.showwarning(
+                "PROCESS ALARM",
+                (
+                    "⚠ PROCESS ALARM ACTIVE\n\n"
+                    "The PLC reports an active "
+                    "process alarm."
+                ),
+                parent=self.root
+            )
+
+        # ====================================================
+        # PROCESS ALARM CLEARED
+        # ====================================================
+
+        elif (
+            not alarm
+            and self.previous_alarm
+            and not fault_code
+            and not emergency_stop
+        ):
+
+            self.add_alarm_history(
+                "CLEARED",
+                0,
+                "Process alarm cleared"
+            )
+
+        # ====================================================
+        # SAVE CURRENT STATE
+        # ====================================================
+
+        self.previous_alarm = bool(alarm)
+
+        self.previous_fault_code = fault_code
+
+        self.previous_emergency_stop = bool(
+            emergency_stop
         )
 
     # ========================================================
@@ -2241,6 +2793,7 @@ class PLCMonitor:
         )
 
         width = self.canvas.winfo_width()
+
         height = self.canvas.winfo_height()
 
         if width < 100 or height < 100:
@@ -2448,7 +3001,8 @@ class PLCMonitor:
                     f"Target: {PLC_IP}:{PLC_PORT}\n"
                     f"Register: {40001 + address}\n"
                     f"Value: {value}"
-                )
+                ),
+                parent=self.root
             )
 
     # ========================================================
@@ -2512,9 +3066,7 @@ class PLCMonitor:
 
                 return
 
-            # ------------------------------------------------
             # Pressure PLC'de x10 ölçekli tutuluyor.
-            # ------------------------------------------------
 
             pressure_scaled = int(
                 round(
@@ -2528,9 +3080,9 @@ class PLCMonitor:
                 f"PRESSURE={pressure:.1f} bar"
             )
 
-            # ------------------------------------------------
+            # =================================================
             # SPEED
-            # ------------------------------------------------
+            # =================================================
 
             speed_ok = self.modbus.write_uint32(
                 REG["SPEED_SETPOINT"],
@@ -2545,9 +3097,9 @@ class PLCMonitor:
 
                 return
 
-            # ------------------------------------------------
+            # =================================================
             # PRESSURE
-            # ------------------------------------------------
+            # =================================================
 
             pressure_ok = self.modbus.write_uint32(
                 REG["PRESSURE_SETPOINT"],
@@ -2568,9 +3120,9 @@ class PLCMonitor:
                 f"PRESSURE={pressure:.1f} bar"
             )
 
-            # ------------------------------------------------
-            # Keep written values in UI.
-            # ------------------------------------------------
+            # =================================================
+            # KEEP WRITTEN VALUES IN UI
+            # =================================================
 
             self.update_entry(
                 self.rpm_entry,
@@ -2604,14 +3156,14 @@ class PLCMonitor:
                 "pressure için sayısal değer girin."
             )
 
-        except Exception as e:
+        except Exception as exc:
 
             print(
-                f"[HMI] Apply setpoints error: {e}"
+                f"[HMI] Apply setpoints error: {exc}"
             )
 
             self.show_message(
-                f"Setpoints uygulanamadı:\n{e}"
+                f"Setpoints uygulanamadı:\n{exc}"
             )
 
     # ========================================================
@@ -2625,30 +3177,17 @@ class PLCMonitor:
         force=False
     ):
 
-        # ----------------------------------------------------
-        # CRITICAL FIX:
-        #
-        # If the user is currently typing in this field,
-        # polling must NOT overwrite the field.
-        #
-        # "force=True" is used after APPLY SETPOINTS so the
-        # successfully written value can be displayed.
-        # ----------------------------------------------------
-
         if not force:
 
             try:
 
                 if self.root.focus_get() == entry:
-
                     return
 
             except Exception:
-
                 pass
 
         if entry.get() == value:
-
             return
 
         entry.delete(
@@ -2661,11 +3200,15 @@ class PLCMonitor:
             value
         )
 
-    def show_message(self, message):
+    def show_message(
+        self,
+        message
+    ):
 
         messagebox.showinfo(
             "Smart PLC Control Center",
-            message
+            message,
+            parent=self.root
         )
 
     def update_clock(self):
@@ -2691,6 +3234,22 @@ class PLCMonitor:
     def close(self):
 
         self.running = False
+
+        try:
+            self.root.unbind(
+                "<MouseWheel>"
+            )
+
+            self.root.unbind(
+                "<Button-4>"
+            )
+
+            self.root.unbind(
+                "<Button-5>"
+            )
+
+        except Exception:
+            pass
 
         self.modbus.disconnect()
 
