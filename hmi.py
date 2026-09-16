@@ -2425,7 +2425,7 @@ class PLCMonitor:
                 return "STARTING", AMBER
 
             if actual_rpm > setpoint:
-                return "STOPPING", AMBER
+                return "STARTING", AMBER
 
             return "RUNNING", GREEN
 
