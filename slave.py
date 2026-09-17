@@ -1,10 +1,26 @@
 import asyncio
 import logging
 import random
+import struct
 from dataclasses import dataclass
 
 from pymodbus.server import ModbusTcpServer
 from pymodbus.simulator import DataType, SimData, SimDevice
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+HOST = "0.0.0.0"
+PORT = 502
+UNIT_ID = 1
+
+SIMULATION_INTERVAL = 1.0
+LOG_INTERVAL = 1.0
+
+INITIAL_SPEED_SETPOINT = 1500.0
+INITIAL_PRESSURE_SETPOINT = 50.0
 
 
 # ============================================================
@@ -13,54 +29,10 @@ from pymodbus.simulator import DataType, SimData, SimDevice
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)-18s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-logger = logging.getLogger("PLC-DEVICE")
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-@dataclass
-class AppConfig:
-    host: str = "0.0.0.0"
-    port: int = 502
-    unit_id: int = 1
-
-    simulation_interval: float = 1.0
-    log_interval: float = 1.0
-
-    speed_setpoint: float = 1500.0
-    pressure_setpoint: float = 50.0
-
-    motor_command: int = 1
-    mode: int = 1
-
-
-CONFIG = AppConfig()
-
-
-# ============================================================
-# REGISTER MAP
-# ============================================================
-
-REGISTER_COUNT = 15
-
-
-class HR:
-    MOTOR_COMMAND = 0
-    MODE = 1
-
-    SPEED_SETPOINT = 2
-    ACTUAL_RPM = 4
-    CURRENT = 6
-    PRESSURE_SETPOINT = 8
-    ACTUAL_PRESSURE = 10
-    TEMPERATURE = 12
-
-    HEARTBEAT = 14
+logger = logging.getLogger("PLC")
 
 
 # ============================================================
@@ -72,178 +44,221 @@ class PLCState:
     motor_command: int = 1
     mode: int = 1
 
-    speed_setpoint: float = 1500.0
+    speed_setpoint: float = INITIAL_SPEED_SETPOINT
     actual_rpm: float = 0.0
-
     current: float = 0.0
 
-    pressure_setpoint: float = 50.0
+    pressure_setpoint: float = INITIAL_PRESSURE_SETPOINT
     actual_pressure: float = 0.0
 
     temperature: float = 25.0
 
     heartbeat: int = 0
+    fault: int = 0
 
 
-STATE = PLCState(
-    motor_command=CONFIG.motor_command,
-    mode=CONFIG.mode,
-    speed_setpoint=CONFIG.speed_setpoint,
-    pressure_setpoint=CONFIG.pressure_setpoint,
-)
+state = PLCState()
+state_lock = asyncio.Lock()
 
 
 # ============================================================
-# REGISTER DATA
+# REGISTER MAP
 # ============================================================
 
-def create_simdata():
-    """
-    Create the actual Modbus register map.
-
-    PyModbus handles FLOAT32 -> 2 registers automatically.
-    """
-
-    return [
-        # 40001
-        SimData(
-            address=0,
-            values=STATE.motor_command,
-            datatype=DataType.UINT16,
-        ),
-
-        # 40002
-        SimData(
-            address=1,
-            values=STATE.mode,
-            datatype=DataType.UINT16,
-        ),
-
-        # 40003-40004
-        SimData(
-            address=2,
-            values=STATE.speed_setpoint,
-            datatype=DataType.FLOAT32,
-        ),
-
-        # 40005-40006
-        SimData(
-            address=4,
-            values=STATE.actual_rpm,
-            datatype=DataType.FLOAT32,
-        ),
-
-        # 40007-40008
-        SimData(
-            address=6,
-            values=STATE.current,
-            datatype=DataType.FLOAT32,
-        ),
-
-        # 40009-40010
-        SimData(
-            address=8,
-            values=STATE.pressure_setpoint,
-            datatype=DataType.FLOAT32,
-        ),
-
-        # 40011-40012
-        SimData(
-            address=10,
-            values=STATE.actual_pressure,
-            datatype=DataType.FLOAT32,
-        ),
-
-        # 40013-40014
-        SimData(
-            address=12,
-            values=STATE.temperature,
-            datatype=DataType.FLOAT32,
-        ),
-
-        # 40015
-        SimData(
-            address=14,
-            values=STATE.heartbeat,
-            datatype=DataType.UINT16,
-        ),
-    ]
+REGISTER_ADDRESS = {
+    "MotorCommand": 0,
+    "Mode": 1,
+    "SpeedSetpoint": 2,
+    "ActualRPM": 4,
+    "Current": 6,
+    "PressureSetpoint": 8,
+    "ActualPressure": 10,
+    "Temperature": 12,
+    "Heartbeat": 14,
+}
 
 
 # ============================================================
-# REGISTER ENCODING
+# FLOAT32 HELPERS
 # ============================================================
 
-def float_to_words(value: float) -> tuple[int, int]:
-    """
-    Convert FLOAT32 to two unsigned 16-bit Modbus words.
-    """
-
-    import struct
-
+def float_to_words(value: float) -> list[int]:
     raw = struct.pack(">f", float(value))
 
-    return struct.unpack(">HH", raw)
+    high_word, low_word = struct.unpack(">HH", raw)
 
+    return [high_word, low_word]
+
+
+def words_to_float(words: list[int]) -> float:
+    if len(words) < 2:
+        raise ValueError(
+            f"FLOAT32 requires 2 registers, received {len(words)}"
+        )
+
+    raw = struct.pack(
+        ">HH",
+        int(words[0]) & 0xFFFF,
+        int(words[1]) & 0xFFFF,
+    )
+
+    return struct.unpack(">f", raw)[0]
+
+
+# ============================================================
+# BUILD REGISTER IMAGE
+# ============================================================
 
 def build_registers() -> list[int]:
-    """
-    Build the current physical register image.
-
-    15 Modbus registers total.
-    """
-
-    import struct
-
-    registers = [0] * REGISTER_COUNT
+    registers = [0] * 15
 
     # --------------------------------------------------------
     # UINT16
     # --------------------------------------------------------
 
-    registers[HR.MOTOR_COMMAND] = (
-        STATE.motor_command & 0xFFFF
-    )
-
-    registers[HR.MODE] = (
-        STATE.mode & 0xFFFF
-    )
+    registers[0] = state.motor_command & 0xFFFF
+    registers[1] = state.mode & 0xFFFF
 
     # --------------------------------------------------------
     # FLOAT32
     # --------------------------------------------------------
 
-    values = [
-        (HR.SPEED_SETPOINT, STATE.speed_setpoint),
-        (HR.ACTUAL_RPM, STATE.actual_rpm),
-        (HR.CURRENT, STATE.current),
-        (HR.PRESSURE_SETPOINT, STATE.pressure_setpoint),
-        (HR.ACTUAL_PRESSURE, STATE.actual_pressure),
-        (HR.TEMPERATURE, STATE.temperature),
-    ]
+    registers[2:4] = float_to_words(
+        state.speed_setpoint
+    )
 
-    for address, value in values:
+    registers[4:6] = float_to_words(
+        state.actual_rpm
+    )
 
-        raw = struct.pack(">f", float(value))
+    registers[6:8] = float_to_words(
+        state.current
+    )
 
-        high, low = struct.unpack(">HH", raw)
+    registers[8:10] = float_to_words(
+        state.pressure_setpoint
+    )
 
-        registers[address] = high
-        registers[address + 1] = low
+    registers[10:12] = float_to_words(
+        state.actual_pressure
+    )
+
+    registers[12:14] = float_to_words(
+        state.temperature
+    )
 
     # --------------------------------------------------------
     # HEARTBEAT
     # --------------------------------------------------------
 
-    registers[HR.HEARTBEAT] = (
-        STATE.heartbeat & 0xFFFF
-    )
+    registers[14] = state.heartbeat & 0xFFFF
 
     return registers
 
 
 # ============================================================
-# MODBUS ACTION
+# APPLY MODBUS WRITE
+# ============================================================
+
+def apply_write(
+    start_address: int,
+    values: list[int],
+):
+    if not values:
+        return
+
+    values = [
+        int(value) & 0xFFFF
+        for value in values
+    ]
+
+    logger.info(
+        "MODBUS WRITE RECEIVED | address=%s | values=%s",
+        start_address,
+        values,
+    )
+
+    # --------------------------------------------------------
+    # MotorCommand
+    # --------------------------------------------------------
+
+    if start_address == 0 and len(values) >= 1:
+
+        state.motor_command = (
+            1 if values[0] else 0
+        )
+
+        logger.info(
+            "PLC WRITE | MotorCommand = %s",
+            state.motor_command,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Mode
+    # --------------------------------------------------------
+
+    if start_address == 1 and len(values) >= 1:
+
+        state.mode = (
+            1 if values[0] else 0
+        )
+
+        logger.info(
+            "PLC WRITE | Mode = %s",
+            state.mode,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # SpeedSetpoint FLOAT32
+    # --------------------------------------------------------
+
+    if start_address == 2 and len(values) >= 2:
+
+        new_value = words_to_float(
+            values[:2]
+        )
+
+        state.speed_setpoint = new_value
+
+        logger.info(
+            "PLC WRITE | SpeedSetpoint = %.2f",
+            state.speed_setpoint,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # PressureSetpoint FLOAT32
+    # --------------------------------------------------------
+
+    if start_address == 8 and len(values) >= 2:
+
+        new_value = words_to_float(
+            values[:2]
+        )
+
+        state.pressure_setpoint = new_value
+
+        logger.info(
+            "PLC WRITE | PressureSetpoint = %.2f",
+            state.pressure_setpoint,
+        )
+
+        return
+
+    logger.warning(
+        "PLC WRITE | Unsupported address=%s values=%s",
+        start_address,
+        values,
+    )
+
+
+# ============================================================
+# SIMULATOR ACTION
 # ============================================================
 
 async def device_action(
@@ -255,244 +270,236 @@ async def device_action(
     set_values,
 ):
     """
-    Expose the continuously simulated PLC state.
+    PyModbus simulator callback.
 
-    The simulation runs independently in simulation_loop().
-    This action only synchronizes the current state with the
-    Modbus read response.
+    function_code:
+        Modbus function code.
+
+    start_address:
+        Address represented by current_registers[0].
+
+    address:
+        Requested Modbus address.
+
+    count:
+        Requested register count.
+
+    current_registers:
+        Current register values.
+
+    set_values:
+        Values supplied by a write request.
     """
 
-    # Function code 03 = Read Holding Registers
-    if function_code == 3:
+    # --------------------------------------------------------
+    # WRITE REQUEST
+    # --------------------------------------------------------
 
-        registers = build_registers()
+    if set_values is not None:
 
-        offset = address - start_address
+        incoming_values = list(set_values)
 
-        if offset < 0:
-            offset = 0
+        logger.info(
+            "SIMULATOR ACTION WRITE | FC=%s | address=%s | "
+            "count=%s | values=%s",
+            function_code,
+            address,
+            count,
+            incoming_values,
+        )
 
-        selected = registers[
-            address:address + count
-        ]
+        apply_write(
+            address,
+            incoming_values,
+        )
 
-        for index, value in enumerate(selected):
+    # --------------------------------------------------------
+    # ALWAYS BUILD CURRENT PLC IMAGE
+    # --------------------------------------------------------
 
-            target_index = offset + index
+    image = build_registers()
 
-            if target_index < len(current_registers):
-                current_registers[target_index] = value
+    # --------------------------------------------------------
+    # COPY REQUESTED PART OF IMAGE
+    # --------------------------------------------------------
+
+    if current_registers is not None:
+
+        for index in range(
+            min(
+                len(current_registers),
+                len(image) - start_address,
+            )
+        ):
+            current_registers[index] = (
+                image[start_address + index]
+            )
 
     return None
 
 
 # ============================================================
-# PLC SIMULATION
+# SIMULATOR DATA MODEL
+# ============================================================
+
+def create_simdata():
+    """
+    Use one raw UINT16 register block.
+
+    We intentionally do NOT define FLOAT32 SimData blocks here.
+
+    FLOAT32 conversion is handled by our own PLC state and
+    device_action() so Modbus writes and reads use exactly
+    the same register map as the SCADA system.
+    """
+
+    return [
+        SimData(
+            address=0,
+            count=15,
+            values=[0] * 15,
+            datatype=DataType.REGISTERS,
+        )
+    ]
+
+
+# ============================================================
+# SIMULATION
 # ============================================================
 
 async def simulation_loop():
 
     while True:
 
-        # ----------------------------------------------------
-        # TARGET RPM
-        # ----------------------------------------------------
+        async with state_lock:
 
-        if STATE.motor_command == 1:
+            # ------------------------------------------------
+            # RPM
+            # ------------------------------------------------
 
-            target_rpm = STATE.speed_setpoint
+            if state.motor_command == 1:
+                target_rpm = state.speed_setpoint
+            else:
+                target_rpm = 0.0
 
-        else:
-
-            target_rpm = 0.0
-
-        # ----------------------------------------------------
-        # RPM RAMP
-        # ----------------------------------------------------
-
-        rpm_error = (
-            target_rpm
-            - STATE.actual_rpm
-        )
-
-        acceleration = 120.0
-
-        if abs(rpm_error) <= acceleration:
-
-            STATE.actual_rpm = target_rpm
-
-        elif rpm_error > 0:
-
-            STATE.actual_rpm += acceleration
-
-        else:
-
-            STATE.actual_rpm -= acceleration
-
-        # Small measurement noise
-        if STATE.actual_rpm > 0:
-
-            STATE.actual_rpm += random.uniform(
-                -3.0,
-                3.0,
+            rpm_difference = (
+                target_rpm
+                - state.actual_rpm
             )
 
-        STATE.actual_rpm = max(
-            0.0,
-            min(
-                STATE.actual_rpm,
-                STATE.speed_setpoint + 10.0,
-            ),
-        )
-
-        # ----------------------------------------------------
-        # CURRENT
-        # ----------------------------------------------------
-
-        if STATE.speed_setpoint > 0:
-
-            rpm_ratio = (
-                STATE.actual_rpm
-                / STATE.speed_setpoint
+            state.actual_rpm += (
+                rpm_difference * 0.15
             )
 
-        else:
+            # ------------------------------------------------
+            # MOTOR RUNNING
+            # ------------------------------------------------
 
-            rpm_ratio = 0.0
+            if state.motor_command == 1:
 
-        if STATE.motor_command == 1:
-
-            base_current = (
-                2.0
-                + 8.0 * rpm_ratio
-            )
-
-            STATE.current = (
-                base_current
-                + random.uniform(
-                    -0.15,
-                    0.15,
+                state.current = (
+                    2.0
+                    + (
+                        state.actual_rpm
+                        / max(
+                            state.speed_setpoint,
+                            1.0,
+                        )
+                    )
+                    * 8.0
                 )
+
+                target_pressure = (
+                    state.pressure_setpoint
+                    * (
+                        state.actual_rpm
+                        / max(
+                            state.speed_setpoint,
+                            1.0,
+                        )
+                    )
+                )
+
+                state.actual_pressure += (
+                    target_pressure
+                    - state.actual_pressure
+                ) * 0.15
+
+                state.temperature += (
+                    state.current * 0.015
+                )
+
+            # ------------------------------------------------
+            # MOTOR STOPPED
+            # ------------------------------------------------
+
+            else:
+
+                state.current *= 0.85
+
+                state.actual_pressure *= 0.90
+
+                state.temperature += (
+                    25.0
+                    - state.temperature
+                ) * 0.03
+
+            # ------------------------------------------------
+            # TEMPERATURE NOISE
+            # ------------------------------------------------
+
+            state.temperature += random.uniform(
+                -0.15,
+                0.15,
             )
 
-        else:
+            # ------------------------------------------------
+            # HEARTBEAT
+            # ------------------------------------------------
 
-            STATE.current = max(
-                0.0,
-                STATE.current - 0.5,
-            )
-
-        # ----------------------------------------------------
-        # PRESSURE
-        # ----------------------------------------------------
-
-        pressure_ratio = min(
-            max(rpm_ratio, 0.0),
-            1.0,
-        )
-
-        target_pressure = (
-            STATE.pressure_setpoint
-            * pressure_ratio
-        )
-
-        STATE.actual_pressure += (
-            target_pressure
-            - STATE.actual_pressure
-        ) * 0.08
-
-        STATE.actual_pressure += random.uniform(
-            -0.15,
-            0.15,
-        )
-
-        STATE.actual_pressure = max(
-            0.0,
-            STATE.actual_pressure,
-        )
-
-        # ----------------------------------------------------
-        # TEMPERATURE
-        # ----------------------------------------------------
-
-        if STATE.motor_command == 1:
-
-            target_temperature = (
-                25.0
-                + (
-                    STATE.actual_rpm
-                    / 1500.0
-                ) * 35.0
-            )
-
-            STATE.temperature += (
-                target_temperature
-                - STATE.temperature
-            ) * 0.015
-
-        else:
-
-            STATE.temperature += (
-                25.0
-                - STATE.temperature
-            ) * 0.02
-
-        STATE.temperature += random.uniform(
-            -0.03,
-            0.03,
-        )
-
-        STATE.temperature = max(
-            20.0,
-            min(
-                STATE.temperature,
-                80.0,
-            ),
-        )
-
-        # ----------------------------------------------------
-        # HEARTBEAT
-        # ----------------------------------------------------
-
-        STATE.heartbeat = (
-            STATE.heartbeat + 1
-        ) % 65536
+            state.heartbeat = (
+                state.heartbeat + 1
+            ) % 65536
 
         await asyncio.sleep(
-            CONFIG.simulation_interval
+            SIMULATION_INTERVAL
         )
 
 
 # ============================================================
-# DEVICE LOGGER
+# LOGGER
 # ============================================================
 
 async def device_logger():
 
     while True:
 
-        logger.info(
-            "DEVICE | "
-            "Motor=%d | "
-            "Mode=%d | "
-            "Speed=%.2f RPM | "
-            "ActualRPM=%.2f | "
-            "Current=%.2f A | "
-            "Pressure=%.2f | "
-            "Temperature=%.2f C | "
-            "Heartbeat=%d",
-            STATE.motor_command,
-            STATE.mode,
-            STATE.speed_setpoint,
-            STATE.actual_rpm,
-            STATE.current,
-            STATE.actual_pressure,
-            STATE.temperature,
-            STATE.heartbeat,
-        )
+        async with state_lock:
+
+            logger.info(
+                "PLC | MOTOR=%s | MODE=%s | "
+                "SETPOINT=%.1f | RPM=%.1f | "
+                "CURRENT=%.2f | PRESSURE=%.2f | "
+                "TEMP=%.2f | HEARTBEAT=%s",
+
+                "RUN"
+                if state.motor_command
+                else "STOP",
+
+                "AUTO"
+                if state.mode
+                else "MANUAL",
+
+                state.speed_setpoint,
+                state.actual_rpm,
+                state.current,
+                state.actual_pressure,
+                state.temperature,
+                state.heartbeat,
+            )
 
         await asyncio.sleep(
-            CONFIG.log_interval
+            LOG_INTERVAL
         )
 
 
@@ -503,104 +510,25 @@ async def device_logger():
 async def main():
 
     logger.info("=" * 70)
-    logger.info(
-        "INDUSTRIAL MODBUS TCP DEVICE SIMULATOR"
-    )
+    logger.info("MODBUS TCP PLC SIMULATOR")
     logger.info("=" * 70)
 
-    logger.info(
-        "Host       : %s",
-        CONFIG.host,
-    )
-
-    logger.info(
-        "Port       : %d",
-        CONFIG.port,
-    )
-
-    logger.info(
-        "Unit ID    : %d",
-        CONFIG.unit_id,
-    )
-
-    logger.info(
-        "Registers  : %d",
-        REGISTER_COUNT,
-    )
-
-    logger.info("-" * 70)
-
-    logger.info(
-        "40001  MotorCommand      UINT16"
-    )
-
-    logger.info(
-        "40002  Mode              UINT16"
-    )
-
-    logger.info(
-        "40003-40004  SpeedSetpoint    FLOAT32"
-    )
-
-    logger.info(
-        "40005-40006  ActualRPM         FLOAT32"
-    )
-
-    logger.info(
-        "40007-40008  Current           FLOAT32"
-    )
-
-    logger.info(
-        "40009-40010  PressureSetpoint  FLOAT32"
-    )
-
-    logger.info(
-        "40011-40012  ActualPressure    FLOAT32"
-    )
-
-    logger.info(
-        "40013-40014  Temperature       FLOAT32"
-    )
-
-    logger.info(
-        "40015  Heartbeat         UINT16"
-    )
-
-    logger.info("-" * 70)
-
-    # --------------------------------------------------------
-    # SimDevice
-    # --------------------------------------------------------
-
-    simdata = create_simdata()
-
-    device = SimDevice(
-        id=CONFIG.unit_id,
-        simdata=simdata,
+    sim_device = SimDevice(
+        id=UNIT_ID,
+        simdata=create_simdata(),
         action=device_action,
     )
 
-    # --------------------------------------------------------
-    # Modbus TCP server
-    # --------------------------------------------------------
-
     server = ModbusTcpServer(
-        device,
-        address=(
-            CONFIG.host,
-            CONFIG.port,
-        ),
+        sim_device,
+        address=(HOST, PORT),
     )
 
     logger.info(
-        "Modbus TCP server başlatılıyor..."
+        "PLC listening on %s:%s",
+        HOST,
+        PORT,
     )
-
-    logger.info(
-        "PLC sürekli veri üretmeye başladı."
-    )
-
-    logger.info("=" * 70)
 
     await asyncio.gather(
         server.serve_forever(),
@@ -616,7 +544,6 @@ async def main():
 if __name__ == "__main__":
 
     try:
-
         asyncio.run(main())
 
     except KeyboardInterrupt:

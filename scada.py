@@ -1,37 +1,27 @@
-from __future__ import annotations
-
+import json
 import logging
-import sqlite3
 import struct
+import threading
 import time
-from dataclasses import dataclass
-from enum import IntEnum
+
+from dataclasses import dataclass, field
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from pymodbus.client import ModbusTcpClient
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
-@dataclass(frozen=True)
+@dataclass
 class AppConfig:
-    # slave.py çalışan bilgisayar
-    ip: str = "127.0.0.1"
-    port: int = 502
-    unit_id: int = 1
-
-    # FLOAT32 word order
-    word_order: str = "big"
-
-    # SCADA PLC'den saniyede 1 kez okur
-    polling_interval_s: float = 1.0
-
-    heartbeat_timeout_s: float = 5.0
-    connection_timeout_s: float = 3.0
-
-    # SQLite database
-    database_path: str = "scada.db"
+    api_url: str = "http://127.0.0.1:8000"
+    api_refresh_interval: float = 5.0
+    connection_timeout: float = 3.0
+    default_poll_interval: float = 1.0
+    reconnect_interval: float = 2.0
 
 
 CONFIG = AppConfig()
@@ -43,731 +33,1384 @@ CONFIG = AppConfig()
 
 logging.basicConfig(
     level=logging.INFO,
-    format=(
-        "%(asctime)s | "
-        "%(levelname)-8s | "
-        "%(name)-18s | "
-        "%(message)s"
-    ),
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-LOGGER = logging.getLogger("SCADA")
+logger = logging.getLogger("SCADA")
 
 
 # ============================================================
-# REGISTER MAP
+# HTTP CLIENT
 # ============================================================
 
-class HR(IntEnum):
-    MOTOR_COMMAND = 0
-    MODE = 1
+class APIClient:
 
-    SPEED_SETPOINT_HI = 2
-    SPEED_SETPOINT_LO = 3
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
 
-    ACTUAL_RPM_HI = 4
-    ACTUAL_RPM_LO = 5
+    def request(self, method: str, endpoint: str, payload=None):
+        url = f"{self.base_url}{endpoint}"
 
-    CURRENT_HI = 6
-    CURRENT_LO = 7
+        data = None
 
-    PRESSURE_SETPOINT_HI = 8
-    PRESSURE_SETPOINT_LO = 9
+        headers = {
+            "Accept": "application/json",
+        }
 
-    ACTUAL_PRESSURE_HI = 10
-    ACTUAL_PRESSURE_LO = 11
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
 
-    TEMPERATURE_HI = 12
-    TEMPERATURE_LO = 13
-
-    HEARTBEAT = 14
-
-    REGISTER_COUNT = 15
-
-
-# ============================================================
-# DATABASE
-# ============================================================
-
-def initialize_database() -> None:
-    """
-    SQLite database ve readings tablosunu oluşturur.
-    """
-
-    connection = sqlite3.connect(
-        CONFIG.database_path
-    )
-
-    try:
-        cursor = connection.cursor()
-
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS plc_readings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-
-                motor_command INTEGER NOT NULL,
-                mode INTEGER NOT NULL,
-
-                speed_setpoint REAL NOT NULL,
-                actual_rpm REAL NOT NULL,
-                current REAL NOT NULL,
-
-                pressure_setpoint REAL NOT NULL,
-                actual_pressure REAL NOT NULL,
-
-                temperature REAL NOT NULL,
-                heartbeat INTEGER NOT NULL,
-
-                raw_40001 INTEGER NOT NULL,
-                raw_40002 INTEGER NOT NULL,
-                raw_40003 INTEGER NOT NULL,
-                raw_40004 INTEGER NOT NULL,
-                raw_40005 INTEGER NOT NULL,
-                raw_40006 INTEGER NOT NULL,
-                raw_40007 INTEGER NOT NULL,
-                raw_40008 INTEGER NOT NULL,
-                raw_40009 INTEGER NOT NULL,
-                raw_40010 INTEGER NOT NULL,
-                raw_40011 INTEGER NOT NULL,
-                raw_40012 INTEGER NOT NULL,
-                raw_40013 INTEGER NOT NULL,
-                raw_40014 INTEGER NOT NULL,
-                raw_40015 INTEGER NOT NULL
-            )
-            """
+        request = Request(
+            url,
+            data=data,
+            headers=headers,
+            method=method,
         )
 
-        connection.commit()
+        try:
+            with urlopen(
+                request,
+                timeout=CONFIG.connection_timeout,
+            ) as response:
 
-    finally:
-        connection.close()
+                body = response.read().decode("utf-8")
 
+                if not body:
+                    return {}
 
-def save_to_database(
-    registers: list[int],
-    values: dict,
-) -> bool:
-    """
-    SCADA tarafından okunan verileri SQLite database'e kaydeder.
+                return json.loads(body)
 
-    decoded değerler:
-        Gerçek mühendislik değerleri.
+        except HTTPError as exc:
 
-    raw_40001 ... raw_40015:
-        Modbus'tan gelen ham 16-bit register değerleri.
-        Hiçbir scaling / bölme / çarpma uygulanmaz.
-    """
+            error_body = ""
 
-    connection = None
+            try:
+                error_body = exc.read().decode("utf-8")
+            except Exception:
+                pass
 
-    try:
-        raw = list(registers)
+            if error_body:
+                raise RuntimeError(
+                    f"HTTP {exc.code}: {error_body}"
+                ) from exc
 
-        # Tam olarak 15 register bekliyoruz.
-        if len(raw) != HR.REGISTER_COUNT:
-            LOGGER.error(
-                "Database kayıt hatası: "
-                "Beklenen %s register, gelen %s.",
-                HR.REGISTER_COUNT,
-                len(raw),
-            )
-            return False
+            raise
 
-        connection = sqlite3.connect(
-            CONFIG.database_path
+    def get(self, endpoint: str):
+        return self.request("GET", endpoint)
+
+    def post(self, endpoint: str, payload):
+        return self.request(
+            "POST",
+            endpoint,
+            payload,
         )
 
-        connection.execute(
-            """
-            INSERT INTO plc_readings (
-                motor_command,
-                mode,
-                speed_setpoint,
-                actual_rpm,
-                current,
-                pressure_setpoint,
-                actual_pressure,
-                temperature,
-                heartbeat,
+    # --------------------------------------------------------
+    # DEVICES
+    # --------------------------------------------------------
 
-                raw_40001,
-                raw_40002,
-                raw_40003,
-                raw_40004,
-                raw_40005,
-                raw_40006,
-                raw_40007,
-                raw_40008,
-                raw_40009,
-                raw_40010,
-                raw_40011,
-                raw_40012,
-                raw_40013,
-                raw_40014,
-                raw_40015
-            )
-            VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?
-            )
-            """,
-            (
-                # ------------------------------------------------
-                # DECODED / ENGINEERING VALUES
-                # ------------------------------------------------
-
-                values["MotorCommand"],
-                values["Mode"],
-                values["SpeedSetpoint"],
-                values["ActualRPM"],
-                values["Current"],
-                values["PressureSetpoint"],
-                values["ActualPressure"],
-                values["Temperature"],
-                values["Heartbeat"],
-
-                # ------------------------------------------------
-                # RAW MODBUS REGISTERS
-                # ------------------------------------------------
-
-                raw[0],
-                raw[1],
-                raw[2],
-                raw[3],
-                raw[4],
-                raw[5],
-                raw[6],
-                raw[7],
-                raw[8],
-                raw[9],
-                raw[10],
-                raw[11],
-                raw[12],
-                raw[13],
-                raw[14],
-            ),
+    def get_devices(self):
+        return self.get(
+            "/api/v1/devices"
         )
 
-        connection.commit()
-
-        return True
-
-    except Exception as exc:
-
-        if connection is not None:
-            connection.rollback()
-
-        LOGGER.error(
-            "SQL database kayıt hatası: %s",
-            exc,
+    def get_device_registers(self, device_id: int):
+        return self.get(
+            f"/api/v1/devices/{device_id}/registers"
         )
 
-        return False
+    # --------------------------------------------------------
+    # COMMANDS
+    # --------------------------------------------------------
 
-    finally:
+    def get_pending_commands(self):
+        return self.get(
+            "/api/v1/commands/pending"
+        )
 
-        if connection is not None:
-            connection.close()
+    def complete_command(
+        self,
+        command_id,
+        success,
+        error=None,
+    ):
+        return self.post(
+            f"/api/v1/commands/{command_id}/result",
+            {
+                "status": (
+                    "completed"
+                    if success
+                    else "failed"
+                ),
+                "error": error,
+            },
+        )
+
+    # --------------------------------------------------------
+    # SNAPSHOT
+    # --------------------------------------------------------
+
+    def send_snapshot(
+        self,
+        device_id,
+        values,
+    ):
+        return self.post(
+            "/api/v1/scada/snapshot",
+            {
+                "device_id": device_id,
+                "values": values,
+            },
+        )
+
+    # --------------------------------------------------------
+    # HEARTBEAT
+    # --------------------------------------------------------
+
+    def heartbeat(
+        self,
+        device_id,
+        status="online",
+        register_count=0,
+        error=None,
+    ):
+        return self.post(
+            "/api/v1/scada/heartbeat",
+            {
+                "device_id": device_id,
+                "status": status,
+                "register_count": register_count,
+                "error": error,
+            },
+        )
 
 
 # ============================================================
-# FLOAT32 DECODER
+# REGISTER HELPERS
 # ============================================================
 
-def decode_float32(
-    first: int,
-    second: int,
-) -> float:
+def register_length(data_type: str) -> int:
 
-    first = int(first) & 0xFFFF
-    second = int(second) & 0xFFFF
-
-    if CONFIG.word_order == "big":
-
-        raw = struct.pack(
-            ">HH",
-            first,
-            second,
-        )
-
-    elif CONFIG.word_order == "little":
-
-        raw = struct.pack(
-            ">HH",
-            second,
-            first,
-        )
-
-    else:
-
-        raise ValueError(
-            f"Geçersiz word_order: "
-            f"{CONFIG.word_order}"
-        )
-
-    return struct.unpack(
-        ">f",
-        raw,
-    )[0]
-
-
-# ============================================================
-# MODBUS CLIENT
-# ============================================================
-
-def create_client() -> ModbusTcpClient:
-
-    return ModbusTcpClient(
-        host=CONFIG.ip,
-        port=CONFIG.port,
-        timeout=CONFIG.connection_timeout_s,
-    )
-
-
-# ============================================================
-# READ REGISTERS
-# ============================================================
-
-def read_registers(
-    client: ModbusTcpClient,
-) -> list[int]:
-
-    response = client.read_holding_registers(
-        address=0,
-        count=HR.REGISTER_COUNT,
-        device_id=CONFIG.unit_id,
-    )
-
-    if response.isError():
-
-        raise RuntimeError(
-            f"Modbus okuma hatası: {response}"
-        )
-
-    if not response.registers:
-
-        raise RuntimeError(
-            "PLC'den register verisi alınamadı."
-        )
-
-    return [
-        int(value) & 0xFFFF
-        for value in response.registers
-    ]
-
-
-# ============================================================
-# CONVERT REGISTERS
-# ============================================================
-
-def convert_registers(
-    registers: list[int],
-) -> dict:
-
-    if len(registers) < HR.REGISTER_COUNT:
-
-        raise RuntimeError(
-            f"Beklenen "
-            f"{HR.REGISTER_COUNT} register, "
-            f"gelen {len(registers)}."
-        )
-
-    return {
-
-        "MotorCommand":
-            registers[HR.MOTOR_COMMAND],
-
-        "Mode":
-            registers[HR.MODE],
-
-        "SpeedSetpoint":
-            decode_float32(
-                registers[HR.SPEED_SETPOINT_HI],
-                registers[HR.SPEED_SETPOINT_LO],
-            ),
-
-        "ActualRPM":
-            decode_float32(
-                registers[HR.ACTUAL_RPM_HI],
-                registers[HR.ACTUAL_RPM_LO],
-            ),
-
-        "Current":
-            decode_float32(
-                registers[HR.CURRENT_HI],
-                registers[HR.CURRENT_LO],
-            ),
-
-        "PressureSetpoint":
-            decode_float32(
-                registers[HR.PRESSURE_SETPOINT_HI],
-                registers[HR.PRESSURE_SETPOINT_LO],
-            ),
-
-        "ActualPressure":
-            decode_float32(
-                registers[HR.ACTUAL_PRESSURE_HI],
-                registers[HR.ACTUAL_PRESSURE_LO],
-            ),
-
-        "Temperature":
-            decode_float32(
-                registers[HR.TEMPERATURE_HI],
-                registers[HR.TEMPERATURE_LO],
-            ),
-
-        "Heartbeat":
-            registers[HR.HEARTBEAT],
+    lengths = {
+        "BOOL": 1,
+        "UINT16": 1,
+        "INT16": 1,
+        "UINT32": 2,
+        "INT32": 2,
+        "FLOAT32": 2,
     }
 
+    if data_type not in lengths:
+        raise ValueError(
+            f"Unsupported data type: {data_type}"
+        )
 
-# ============================================================
-# PRINT SCADA DATA
-# ============================================================
+    return lengths[data_type]
 
-def print_values(
-    values: dict,
-) -> None:
 
-    LOGGER.info(
-        "SCADA DATA | "
-        "Motor=%s | "
-        "Mode=%s | "
-        "Speed=%.2f | "
-        "RPM=%.2f | "
-        "Current=%.2f A | "
-        "PressureSP=%.2f | "
-        "Pressure=%.2f | "
-        "Temperature=%.2f C | "
-        "Heartbeat=%s",
+def decode_registers(
+    registers: list[int],
+    data_type: str,
+):
 
-        values["MotorCommand"],
-        values["Mode"],
-        values["SpeedSetpoint"],
-        values["ActualRPM"],
-        values["Current"],
-        values["PressureSetpoint"],
-        values["ActualPressure"],
-        values["Temperature"],
-        values["Heartbeat"],
+    if data_type == "BOOL":
+        return bool(registers[0])
+
+    if data_type == "UINT16":
+        return registers[0]
+
+    if data_type == "INT16":
+
+        raw = struct.pack(
+            ">H",
+            registers[0],
+        )
+
+        return struct.unpack(
+            ">h",
+            raw,
+        )[0]
+
+    if data_type == "UINT32":
+
+        raw = struct.pack(
+            ">HH",
+            registers[0],
+            registers[1],
+        )
+
+        return struct.unpack(
+            ">I",
+            raw,
+        )[0]
+
+    if data_type == "INT32":
+
+        raw = struct.pack(
+            ">HH",
+            registers[0],
+            registers[1],
+        )
+
+        return struct.unpack(
+            ">i",
+            raw,
+        )[0]
+
+    if data_type == "FLOAT32":
+
+        raw = struct.pack(
+            ">HH",
+            registers[0],
+            registers[1],
+        )
+
+        return struct.unpack(
+            ">f",
+            raw,
+        )[0]
+
+    raise ValueError(
+        f"Unsupported data type: {data_type}"
+    )
+
+
+def encode_value(value, data_type):
+    """
+    Convert an engineering value into Modbus holding-register words.
+
+    FLOAT32 uses IEEE-754 big-endian representation:
+        float -> 4 bytes -> 2 x 16-bit Modbus registers
+    """
+
+    data_type = str(data_type).upper()
+
+    if data_type == "UINT16":
+        value = int(round(float(value)))
+
+        if not 0 <= value <= 65535:
+            raise ValueError(
+                f"UINT16 value out of range: {value}"
+            )
+
+        return [value]
+
+    if data_type == "INT16":
+        value = int(round(float(value)))
+
+        if not -32768 <= value <= 32767:
+            raise ValueError(
+                f"INT16 value out of range: {value}"
+            )
+
+        if value < 0:
+            value += 65536
+
+        return [value]
+
+    if data_type == "FLOAT32":
+        raw = struct.pack(">f", float(value))
+
+        high_word, low_word = struct.unpack(">HH", raw)
+
+        return [high_word, low_word]
+
+    if data_type == "UINT32":
+        value = int(round(float(value)))
+
+        if not 0 <= value <= 4294967295:
+            raise ValueError(
+                f"UINT32 value out of range: {value}"
+            )
+
+        return [
+            (value >> 16) & 0xFFFF,
+            value & 0xFFFF,
+        ]
+
+    if data_type == "INT32":
+        value = int(round(float(value)))
+
+        if not -2147483648 <= value <= 2147483647:
+            raise ValueError(
+                f"INT32 value out of range: {value}"
+            )
+
+        if value < 0:
+            value += 4294967296
+
+        return [
+            (value >> 16) & 0xFFFF,
+            value & 0xFFFF,
+        ]
+
+    raise ValueError(
+        f"Unsupported data type for write: {data_type}"
     )
 
 
 # ============================================================
-# VALUE CHANGE CHECK
+# SCALING
 # ============================================================
 
-def values_changed(
-    old: dict,
-    new: dict,
-) -> bool:
+def apply_scaling(
+    raw_value,
+    register,
+):
+    multiplier = float(
+        register.get(
+            "multiplier",
+            1.0,
+        )
+    )
 
-    for key in new:
+    offset = float(
+        register.get(
+            "offset",
+            0.0,
+        )
+    )
 
-        old_value = old[key]
-        new_value = new[key]
+    return (
+        raw_value * multiplier
+        + offset
+    )
 
-        if isinstance(new_value, float):
 
-            if abs(
-                new_value - old_value
-            ) > 0.000001:
+def remove_scaling(
+    engineering_value,
+    register,
+):
+    multiplier = float(
+        register.get(
+            "multiplier",
+            1.0,
+        )
+    )
 
-                return True
+    offset = float(
+        register.get(
+            "offset",
+            0.0,
+        )
+    )
 
-        else:
+    if multiplier == 0:
+        raise ValueError(
+            f"Multiplier cannot be zero for "
+            f"register {register.get('name')}"
+        )
 
-            if new_value != old_value:
-
-                return True
-
-    return False
+    return (
+        float(engineering_value) - offset
+    ) / multiplier
 
 
 # ============================================================
-# SCADA MONITOR
+# DEVICE STATE
 # ============================================================
 
-def monitor() -> None:
+@dataclass
+class DeviceState:
 
-    LOGGER.info("=" * 70)
+    device: dict
 
-    LOGGER.info(
-        "INDUSTRIAL SCADA CLIENT"
+    registers: list = field(
+        default_factory=list
     )
 
-    LOGGER.info("=" * 70)
+    client: object = None
 
-    LOGGER.info(
-        "PLC IP       : %s",
-        CONFIG.ip,
+    connected: bool = False
+
+    last_connection_attempt: float = 0.0
+
+    last_successful_read: float = 0.0
+
+    last_heartbeat: object = None
+
+    last_register_refresh: float = 0.0
+
+    lock: threading.Lock = field(
+        default_factory=threading.Lock
     )
 
-    LOGGER.info(
-        "PLC PORT     : %s",
-        CONFIG.port,
-    )
+    def device_id(self):
+        return self.device["id"]
 
-    LOGGER.info(
-        "UNIT ID      : %s",
-        CONFIG.unit_id,
-    )
+    def device_name(self):
+        return self.device["name"]
 
-    LOGGER.info(
-        "POLLING      : %.0f ms",
-        CONFIG.polling_interval_s * 1000,
-    )
+    def host(self):
+        return self.device["host"]
 
-    LOGGER.info(
-        "DATABASE     : %s",
-        CONFIG.database_path,
-    )
+    def port(self):
+        return self.device["port"]
 
-    LOGGER.info(
-        "HEARTBEAT    : %.1f sec",
-        CONFIG.heartbeat_timeout_s,
-    )
+    def unit_id(self):
+        return self.device["unit_id"]
 
-    LOGGER.info("=" * 70)
+    def poll_interval(self):
 
-    # --------------------------------------------------------
-    # DATABASE
-    # --------------------------------------------------------
+        value = self.device.get(
+            "poll_interval",
+            1000,
+        )
 
-    initialize_database()
+        try:
+            value = float(value) / 1000.0
+        except (
+            TypeError,
+            ValueError,
+        ):
+            value = CONFIG.default_poll_interval
 
-    LOGGER.info(
-        "SQL database hazır."
-    )
+        return max(
+            value,
+            0.1,
+        )
 
-    # --------------------------------------------------------
-    # MODBUS
-    # --------------------------------------------------------
 
-    client = create_client()
+# ============================================================
+# SCADA ENGINE
+# ============================================================
 
-    last_values = None
-    last_heartbeat = None
-    last_heartbeat_time = time.monotonic()
-    heartbeat_warning = False
-    connected = False
+class SCADAEngine:
 
-    try:
+    def __init__(self):
 
-        while True:
+        self.api = APIClient(
+            CONFIG.api_url
+        )
 
-            # ------------------------------------------------
-            # CONNECTION
-            # ------------------------------------------------
+        self.devices = {}
 
-            if not connected:
+        self.devices_lock = threading.Lock()
 
-                LOGGER.info(
-                    "PLC'ye bağlanılıyor: %s:%s",
-                    CONFIG.ip,
-                    CONFIG.port,
+        self.running = True
+
+        self.last_device_refresh = 0.0
+
+    # ========================================================
+    # DEVICE CONFIGURATION
+    # ========================================================
+
+    def refresh_devices(self):
+
+        try:
+
+            response = self.api.get_devices()
+
+            devices = response.get(
+                "devices",
+                [],
+            )
+
+            active_devices = {
+                device["id"]: device
+                for device in devices
+                if device.get(
+                    "enabled",
+                    True,
                 )
+            }
+
+            with self.devices_lock:
+
+                existing_ids = set(
+                    self.devices.keys()
+                )
+
+                active_ids = set(
+                    active_devices.keys()
+                )
+
+                new_ids = (
+                    active_ids
+                    - existing_ids
+                )
+
+                removed_ids = (
+                    existing_ids
+                    - active_ids
+                )
+
+                # --------------------------------------------
+                # Update existing devices
+                # --------------------------------------------
+
+                for device_id, device in (
+                    active_devices.items()
+                ):
+
+                    if device_id in self.devices:
+
+                        self.devices[
+                            device_id
+                        ].device = device
+
+                # --------------------------------------------
+                # Add new devices
+                # --------------------------------------------
+
+                for device_id in new_ids:
+
+                    state = DeviceState(
+                        device=active_devices[
+                            device_id
+                        ]
+                    )
+
+                    self.devices[
+                        device_id
+                    ] = state
+
+                    logger.info(
+                        "New device discovered: "
+                        "%s (%s:%s)",
+                        state.device_name(),
+                        state.host(),
+                        state.port(),
+                    )
+
+                # --------------------------------------------
+                # Remove disabled/deleted devices
+                # --------------------------------------------
+
+                for device_id in removed_ids:
+
+                    state = self.devices[
+                        device_id
+                    ]
+
+                    logger.info(
+                        "Device removed or disabled: %s",
+                        state.device_name(),
+                    )
+
+                    self.close_device(
+                        state
+                    )
+
+                    del self.devices[
+                        device_id
+                    ]
+
+            # ------------------------------------------------
+            # Refresh register configuration
+            # ------------------------------------------------
+
+            for device_id in active_devices:
+
+                self.refresh_device_registers(
+                    device_id
+                )
+
+            self.last_device_refresh = (
+                time.time()
+            )
+
+            logger.info(
+                "Device configuration loaded: %d devices",
+                len(active_devices),
+            )
+
+        except Exception as exc:
+
+            logger.error(
+                "Could not load device configuration: %s",
+                exc,
+            )
+
+    # ========================================================
+    # REGISTER CONFIGURATION
+    # ========================================================
+
+    def refresh_device_registers(
+        self,
+        device_id,
+    ):
+
+        try:
+
+            response = (
+                self.api.get_device_registers(
+                    device_id
+                )
+            )
+
+            registers = response.get(
+                "registers",
+                [],
+            )
+
+            registers = [
+                register
+                for register in registers
+                if register.get(
+                    "enabled",
+                    True,
+                )
+            ]
+
+            registers.sort(
+                key=lambda item: item[
+                    "address"
+                ]
+            )
+
+            with self.devices_lock:
+
+                state = self.devices.get(
+                    device_id
+                )
+
+            if state is None:
+                return
+
+            with state.lock:
+
+                state.registers = registers
+
+                state.last_register_refresh = (
+                    time.time()
+                )
+
+            logger.info(
+                "%s: Register configuration loaded: %d registers",
+                state.device_name(),
+                len(registers),
+            )
+
+        except Exception as exc:
+
+            logger.error(
+                "Device %s register configuration error: %s",
+                device_id,
+                exc,
+            )
+
+    # ========================================================
+    # MODBUS CONNECTION
+    # ========================================================
+
+    def connect_device(
+        self,
+        state: DeviceState,
+    ):
+
+        now = time.time()
+
+        if (
+            now
+            - state.last_connection_attempt
+            < CONFIG.reconnect_interval
+        ):
+            return False
+
+        state.last_connection_attempt = now
+
+        self.close_device(
+            state
+        )
+
+        try:
+
+            client = ModbusTcpClient(
+                host=state.host(),
+                port=state.port(),
+                timeout=CONFIG.connection_timeout,
+            )
+
+            if client.connect():
+
+                state.client = client
+
+                if not state.connected:
+
+                    logger.info(
+                        "%s connected to PLC %s:%s",
+                        state.device_name(),
+                        state.host(),
+                        state.port(),
+                    )
+
+                state.connected = True
 
                 try:
 
-                    connected = client.connect()
+                    self.api.heartbeat(
+                        device_id=state.device_id(),
+                        status="online",
+                        register_count=len(
+                            state.registers
+                        ),
+                    )
 
                 except Exception as exc:
 
-                    LOGGER.error(
-                        "PLC bağlantı hatası: %s",
+                    logger.warning(
+                        "%s heartbeat failed: %s",
+                        state.device_name(),
                         exc,
                     )
 
-                    connected = False
+                return True
 
-                if not connected:
+            client.close()
 
-                    LOGGER.warning(
-                        "PLC'ye bağlanılamadı."
-                    )
+        except Exception as exc:
 
-                    time.sleep(2)
+            logger.error(
+                "%s connection error: %s",
+                state.device_name(),
+                exc,
+            )
 
-                    continue
+        state.connected = False
 
-                LOGGER.info(
-                    "PLC bağlantısı başarılı."
+        return False
+
+    # ========================================================
+    # CLOSE DEVICE
+    # ========================================================
+
+    def close_device(
+        self,
+        state: DeviceState,
+    ):
+
+        if state.client:
+
+            try:
+                state.client.close()
+            except Exception:
+                pass
+
+        state.client = None
+        state.connected = False
+
+    # ========================================================
+    # MODBUS READ
+    # ========================================================
+
+    def read_device_registers(
+        self,
+        state: DeviceState,
+    ):
+
+        with state.lock:
+
+            registers = list(
+                state.registers
+            )
+
+        if not registers:
+            return []
+
+        if state.client is None:
+            raise RuntimeError(
+                "PLC is not connected"
+            )
+
+        start_address = min(
+            item["address"]
+            for item in registers
+        )
+
+        end_address = max(
+            item["address"]
+            + register_length(
+                item["data_type"]
+            )
+            - 1
+            for item in registers
+        )
+
+        count = (
+            end_address
+            - start_address
+            + 1
+        )
+
+        try:
+
+            response = (
+                state.client.read_holding_registers(
+                    address=start_address,
+                    count=count,
+                    device_id=state.unit_id(),
+                )
+            )
+
+            if response.isError():
+
+                raise RuntimeError(
+                    f"Modbus read error: {response}"
                 )
 
-            # ------------------------------------------------
-            # READ
-            # ------------------------------------------------
+            raw = list(
+                response.registers
+            )
+
+            snapshot = []
+
+            for register in registers:
+
+                offset = (
+                    register["address"]
+                    - start_address
+                )
+
+                length = register_length(
+                    register["data_type"]
+                )
+
+                words = raw[
+                    offset:
+                    offset + length
+                ]
+
+                if len(words) != length:
+                    continue
+
+                raw_value = decode_registers(
+                    words,
+                    register["data_type"],
+                )
+
+                value = apply_scaling(
+                    raw_value,
+                    register,
+                )
+
+                snapshot.append(
+                    {
+                        "register_id": register[
+                            "id"
+                        ],
+                        "value": value,
+                    }
+                )
+
+                if (
+                    register["name"]
+                    == "Heartbeat"
+                ):
+
+                    state.last_heartbeat = value
+
+            state.last_successful_read = (
+                time.time()
+            )
+
+            return snapshot
+
+        except Exception:
+
+            self.close_device(
+                state
+            )
 
             try:
 
-                registers = read_registers(
-                    client
+                self.api.heartbeat(
+                    device_id=state.device_id(),
+                    status="offline",
+                    register_count=len(
+                        registers
+                    ),
+                    error="Modbus read failed",
                 )
 
-                values = convert_registers(
-                    registers
+            except Exception:
+                pass
+
+            raise
+
+    # ========================================================
+    # MODBUS WRITE
+    # ========================================================
+
+    def write_register(self, state, register, value):
+        register_id = register["id"]
+        name = register["name"]
+        address = int(register["address"])
+        data_type = str(register["data_type"]).upper()
+
+        try:
+            engineering_value = float(value)
+
+            # Remove engineering scaling before writing raw PLC value.
+            raw_value = remove_scaling(
+                engineering_value,
+                register,
+            )
+
+            words = encode_value(
+                raw_value,
+                data_type,
+            )
+
+            if not words:
+                raise ValueError(
+                    f"No Modbus words generated for {name}"
+                )
+
+            logging.info(
+                "PLC WRITE REQUEST | %s | address=%s | type=%s | value=%s | words=%s",
+                state.device["name"],
+                address,
+                data_type,
+                engineering_value,
+                words,
+            )
+
+            if len(words) == 1:
+                result = state.client.write_register(
+                    address=address,
+                    value=words[0],
+                    device_id=state.unit_id(),
+                )
+            else:
+                result = state.client.write_registers(
+                    address=address,
+                    values=words,
+                    device_id=state.unit_id(),
+                )
+
+            if result.isError():
+                raise RuntimeError(
+                    f"Modbus write failed: {result}"
+                )
+
+            logging.info(
+                "PLC WRITE SUCCESS | %s | %s = %s | words=%s",
+                state.device["name"],
+                name,
+                engineering_value,
+                words,
+            )
+
+            return True
+
+        except Exception as exc:
+            logging.error(
+                "PLC WRITE FAILED | %s | %s = %s | %s",
+                state.device["name"],
+                name,
+                value,
+                exc,
+            )
+
+            return False
+
+    # ========================================================
+    # FIND REGISTER
+    # ========================================================
+
+    def find_register(
+        self,
+        state: DeviceState,
+        register_id,
+    ):
+
+        with state.lock:
+
+            for register in state.registers:
+
+                if register["id"] == register_id:
+                    return register
+
+        return None
+
+    # ========================================================
+    # COMMAND PROCESSING
+    # ========================================================
+
+    def process_commands(self):
+
+        try:
+
+            response = (
+                self.api.get_pending_commands()
+            )
+
+            commands = response.get(
+                "commands",
+                [],
+            )
+
+            for command in commands:
+
+                command_id = command["id"]
+
+                device_id = command.get(
+                    "device_id"
+                )
+
+                if device_id is None:
+
+                    logger.error(
+                        "Command %s has no device_id",
+                        command_id,
+                    )
+
+                    try:
+
+                        self.api.complete_command(
+                            command_id,
+                            False,
+                            "Command has no device_id",
+                        )
+
+                    except Exception:
+                        pass
+
+                    continue
+
+                with self.devices_lock:
+
+                    state = self.devices.get(
+                        device_id
+                    )
+
+                if state is None:
+
+                    logger.warning(
+                        "Command %s belongs to unknown device %s",
+                        command_id,
+                        device_id,
+                    )
+
+                    try:
+
+                        self.api.complete_command(
+                            command_id,
+                            False,
+                            f"Device {device_id} is not available",
+                        )
+
+                    except Exception:
+                        pass
+
+                    continue
+
+                try:
+
+                    if not state.connected:
+
+                        if not self.connect_device(
+                            state
+                        ):
+
+                            raise RuntimeError(
+                                f"{state.device_name()} "
+                                f"is not connected"
+                            )
+
+                    register = self.find_register(
+                        state,
+                        command["register_id"],
+                    )
+
+                    if register is None:
+
+                        raise RuntimeError(
+                            f"Register "
+                            f"{command['register_id']} "
+                            f"does not belong to "
+                            f"device {device_id}"
+                        )
+
+                    if register["access"] not in (
+                        "write",
+                        "read_write",
+                    ):
+
+                        raise RuntimeError(
+                            f"Register "
+                            f"{register['name']} "
+                            f"is not writable"
+                        )
+
+                    self.write_register(
+                        state=state,
+                        register=register,
+                        value=command["value"],
+                    )
+
+                    self.api.complete_command(
+                        command_id,
+                        True,
+                    )
+
+                    logger.info(
+                        "Command executed | "
+                        "%s | %s = %s",
+                        state.device_name(),
+                        register["name"],
+                        command["value"],
+                    )
+
+                except Exception as exc:
+
+                    logger.error(
+                        "Command %s failed on %s: %s",
+                        command_id,
+                        state.device_name(),
+                        exc,
+                    )
+
+                    try:
+
+                        self.api.complete_command(
+                            command_id,
+                            False,
+                            str(exc),
+                        )
+
+                    except Exception:
+                        pass
+
+        except Exception as exc:
+
+            logger.error(
+                "Command polling error: %s",
+                exc,
+            )
+
+    # ========================================================
+    # SNAPSHOT
+    # ========================================================
+
+    def publish_snapshot(
+        self,
+        state: DeviceState,
+        snapshot,
+    ):
+
+        if not snapshot:
+            return
+
+        try:
+
+            self.api.send_snapshot(
+                device_id=state.device_id(),
+                values=snapshot,
+            )
+
+        except Exception as exc:
+
+            logger.error(
+                "%s snapshot API error: %s",
+                state.device_name(),
+                exc,
+            )
+
+    # ========================================================
+    # DEVICE POLLING
+    # ========================================================
+
+    def poll_device(
+        self,
+        state: DeviceState,
+    ):
+
+        if (
+            time.time()
+            - state.last_register_refresh
+            >= CONFIG.api_refresh_interval
+        ):
+
+            self.refresh_device_registers(
+                state.device_id()
+            )
+
+        if state.client is None:
+
+            if not self.connect_device(
+                state
+            ):
+                return
+
+        snapshot = (
+            self.read_device_registers(
+                state
+            )
+        )
+
+        if snapshot:
+
+            self.publish_snapshot(
+                state,
+                snapshot,
+            )
+
+    # ========================================================
+    # MAIN LOOP
+    # ========================================================
+
+    def run(self):
+
+        logger.info("=" * 70)
+
+        logger.info(
+            "SCADAWATT MULTI-DEVICE SCADA ENGINE"
+        )
+
+        logger.info("=" * 70)
+
+        self.refresh_devices()
+
+        while self.running:
+
+            cycle_start = time.time()
+
+            try:
+
+                if (
+                    time.time()
+                    - self.last_device_refresh
+                    >= CONFIG.api_refresh_interval
+                ):
+
+                    self.refresh_devices()
+
+                with self.devices_lock:
+
+                    device_states = list(
+                        self.devices.values()
+                    )
+
+                for state in device_states:
+
+                    if not self.running:
+                        break
+
+                    try:
+
+                        self.poll_device(
+                            state
+                        )
+
+                    except Exception as exc:
+
+                        logger.error(
+                            "%s polling error: %s",
+                            state.device_name(),
+                            exc,
+                        )
+
+                        self.close_device(
+                            state
+                        )
+
+                        state.connected = False
+
+                self.process_commands()
+
+            except (
+                ConnectionError,
+                URLError,
+                HTTPError,
+            ) as exc:
+
+                logger.error(
+                    "Communication error: %s",
+                    exc,
                 )
 
             except Exception as exc:
 
-                LOGGER.error(
-                    "Modbus okuma hatası: %s",
+                logger.error(
+                    "SCADA cycle error: %s",
                     exc,
                 )
 
-                connected = False
-
-                try:
-                    client.close()
-                except Exception:
-                    pass
-
-                time.sleep(1)
-
-                continue
-
-            # ------------------------------------------------
-            # DATABASE
-            # ------------------------------------------------
-
-            database_saved = save_to_database(
-                registers,
-                values,
+            elapsed = (
+                time.time()
+                - cycle_start
             )
 
-            if database_saved:
+            with self.devices_lock:
 
-                LOGGER.debug(
-                    "PLC verisi SQL database'e kaydedildi."
-                )
+                if self.devices:
 
-            # ------------------------------------------------
-            # HEARTBEAT
-            # ------------------------------------------------
+                    poll_intervals = [
+                        state.poll_interval()
+                        for state in
+                        self.devices.values()
+                    ]
 
-            heartbeat = values[
-                "Heartbeat"
-            ]
+                    sleep_time = min(
+                        poll_intervals
+                    )
 
-            if last_heartbeat is None:
+                else:
 
-                last_heartbeat = heartbeat
+                    sleep_time = (
+                        CONFIG.default_poll_interval
+                    )
 
-                last_heartbeat_time = (
-                    time.monotonic()
-                )
-
-                LOGGER.info(
-                    "Heartbeat başlatıldı: %s",
-                    heartbeat,
-                )
-
-            elif heartbeat != last_heartbeat:
-
-                LOGGER.info(
-                    "HEARTBEAT | %s -> %s",
-                    last_heartbeat,
-                    heartbeat,
-                )
-
-                last_heartbeat = heartbeat
-
-                last_heartbeat_time = (
-                    time.monotonic()
-                )
-
-                heartbeat_warning = False
-
-            else:
-
-                elapsed = (
-                    time.monotonic()
-                    - last_heartbeat_time
-                )
-
-                if (
-                    elapsed
-                    > CONFIG.heartbeat_timeout_s
-                ):
-
-                    if not heartbeat_warning:
-
-                        LOGGER.warning(
-                            "HEARTBEAT TIMEOUT | "
-                            "PLC %.2f saniyedir "
-                            "heartbeat değiştirmiyor.",
-                            elapsed,
-                        )
-
-                        heartbeat_warning = True
-
-            # ------------------------------------------------
-            # DATA CHANGE
-            # ------------------------------------------------
-
-            if last_values is None:
-
-                LOGGER.info(
-                    "İlk PLC verisi alındı."
-                )
-
-                print_values(
-                    values
-                )
-
-                last_values = values
-
-            elif values_changed(
-                last_values,
-                values,
-            ):
-
-                print_values(
-                    values
-                )
-
-                last_values = values
-
-            # ------------------------------------------------
-            # POLLING
-            # ------------------------------------------------
+            sleep_time = max(
+                0.05,
+                sleep_time - elapsed,
+            )
 
             time.sleep(
-                CONFIG.polling_interval_s
+                sleep_time
             )
+
+        with self.devices_lock:
+
+            for state in self.devices.values():
+
+                self.close_device(
+                    state
+                )
+
+    # ========================================================
+    # STOP
+    # ========================================================
+
+    def stop(self):
+
+        self.running = False
+
+        with self.devices_lock:
+
+            for state in self.devices.values():
+
+                self.close_device(
+                    state
+                )
+
+
+# ============================================================
+# APPLICATION
+# ============================================================
+
+def main():
+
+    engine = SCADAEngine()
+
+    try:
+
+        engine.run()
 
     except KeyboardInterrupt:
 
-        LOGGER.info(
-            "SCADA client kullanıcı tarafından durduruldu."
+        logger.info(
+            "SCADA shutting down..."
         )
 
     finally:
 
-        client.close()
+        engine.stop()
 
-        LOGGER.info(
-            "PLC bağlantısı kapatıldı."
-        )
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 if __name__ == "__main__":
-
-    try:
-
-        monitor()
-
-    except Exception as exc:
-
-        LOGGER.exception(
-            "SCADA client beklenmeyen hata nedeniyle kapandı: %s",
-            exc,
-        )
+    main()
