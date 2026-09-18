@@ -1052,10 +1052,6 @@ def seed_registers(
 initialize_database()
 
 
-# ============================================================
-# PYDANTIC MODELS
-# ============================================================
-
 class DeviceCreate(BaseModel):
     name: str = Field(
         min_length=1,
@@ -1175,10 +1171,6 @@ class ScadaHeartbeat(BaseModel):
     error: str | None = None
 
 
-# ============================================================
-# ROOT
-# ============================================================
-
 @app.get("/Emirhan")
 def root():
     return {
@@ -1191,17 +1183,8 @@ def root():
     }
 
 
-# ============================================================
-# DEVICE CRUD
-# ============================================================
-
 @app.get("/api/v1/devices")
-def get_devices(
-    enabled_only: bool = Query(
-        default=False,
-        description="Return only enabled devices.",
-    ),
-):
+def get_devices(enabled_only: bool = Query(default=False, description="Return only enabled devices.",),):
     connection = get_connection()                                   
 
     try:
@@ -1363,10 +1346,7 @@ def create_device(device: DeviceCreate):
 
 
 @app.put("/api/v1/devices/{device_id}")
-def update_device(
-    device_id: int,
-    device: DeviceUpdate,
-):
+def update_device(device_id: int, device: DeviceUpdate,):
     connection = get_connection()
 
     try:
@@ -1514,6 +1494,7 @@ def showDevices(device_id: int):
     finally:
         connection.close()
 
+
 @app.delete("/api/v1/devices/{device_id}")
 def delete_device(device_id: int):
     connection = get_connection()
@@ -1554,10 +1535,6 @@ def delete_device(device_id: int):
         connection.close()
 
 
-# ============================================================
-# REGISTER CRUD
-# ============================================================
-
 @app.get("/api/v1/registers")
 def get_registers(
     enabled_only: bool = Query(
@@ -1568,6 +1545,10 @@ def get_registers(
         default=None,
         description="Filter registers by device.",
     ),
+    emirhan_düsündügün_gibi_mi_görceeess: str = Query(
+        default=True,
+        description="doğru düsündün la",
+    )
 ):
     connection = get_connection()
 
