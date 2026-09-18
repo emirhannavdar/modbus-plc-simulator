@@ -1,10 +1,22 @@
 import json
+import getpass
+import sys
 import sqlite3
+import ipaddress
+import os
+import secrets
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+import jwt
+from fastapi import FastAPI, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.openapi.utils import get_openapi
+from pwdlib import PasswordHash
 from pydantic import BaseModel, Field
 
 
@@ -16,6 +28,328 @@ BASE_DIR = Path(__file__).resolve().parent
 DATABASE_PATH = BASE_DIR / "scada.db"
 
 SCADA_TIMEOUT_SECONDS = 5
+
+# ============================================================
+# SECURITY CONFIGURATION
+# ============================================================
+
+API_VERSION = "6.1.0"
+
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY") or secrets.token_urlsafe(64)
+ACCESS_TOKEN_EXPIRE_MINUTES = int(
+    os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30")
+)
+
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+
+# Comma-separated IPs/CIDRs. Example:
+# 127.0.0.1,::1,192.168.1.0/24
+ALLOWED_IPS_RAW = os.getenv(
+    "ALLOWED_IPS",
+    "127.0.0.1,::1",
+)
+ALLOWED_IP_NETWORKS = []
+for _item in ALLOWED_IPS_RAW.split(","):
+    _item = _item.strip()
+    if not _item:
+        continue
+    try:
+        ALLOWED_IP_NETWORKS.append(
+            ipaddress.ip_network(_item, strict=False)
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Invalid ALLOWED_IPS entry: {_item}"
+        ) from exc
+
+# Internal SCADA/slave service token.
+# Keep this outside source control.
+SCADA_SERVICE_TOKEN = os.getenv("SCADA_SERVICE_TOKEN")
+
+# CORS is disabled by default. Example:
+# CORS_ORIGINS=http://localhost:3000,http://192.168.1.20:3000
+CORS_ORIGINS = [
+    item.strip()
+    for item in os.getenv("CORS_ORIGINS", "").split(",")
+    if item.strip()
+]
+
+# Hosts accepted by the API.
+ALLOWED_HOSTS = [
+    item.strip()
+    for item in os.getenv(
+        "ALLOWED_HOSTS",
+        "127.0.0.1,localhost",
+    ).split(",")
+    if item.strip()
+]
+
+pwd_hasher = PasswordHash.recommended()
+
+# Simple in-process login throttling.
+# For multi-worker/production deployments, enforce rate limiting
+# at the reverse proxy/API gateway as well.
+LOGIN_WINDOW_SECONDS = 60
+LOGIN_MAX_ATTEMPTS = 5
+_login_attempts: dict[str, list[float]] = {}
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _ip_allowed(client_ip: str) -> bool:
+    if client_ip == "unknown":
+        return False
+
+    try:
+        address = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+
+    return any(address in network for network in ALLOWED_IP_NETWORKS)
+
+
+def _login_rate_limited(client_ip: str) -> bool:
+    now = time.monotonic()
+    attempts = _login_attempts.setdefault(client_ip, [])
+    attempts[:] = [
+        timestamp
+        for timestamp in attempts
+        if now - timestamp < LOGIN_WINDOW_SECONDS
+    ]
+
+    if len(attempts) >= LOGIN_MAX_ATTEMPTS:
+        return True
+
+    attempts.append(now)
+    return False
+
+
+def _create_access_token(username: str, role: str) -> str:
+    now = int(time.time())
+    payload = {
+        "sub": username,
+        "role": role,
+        "iat": now,
+        "exp": now + ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "type": "access",
+    }
+    return jwt.encode(
+        payload,
+        JWT_SECRET_KEY,
+        algorithm=JWT_ALGORITHM,
+    )
+
+
+def _decode_access_token(token: str) -> dict:
+    try:
+        payload = jwt.decode(
+            token,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM],
+        )
+    except jwt.PyJWTError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired access token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+    if payload.get("type") != "access" or not payload.get("sub"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid access token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return payload
+
+
+def _extract_bearer_token(request: Request) -> str | None:
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, credentials = authorization.partition(" ")
+
+    if scheme.lower() != "bearer" or not credentials:
+        return None
+
+    return credentials.strip()
+
+
+def _role_allowed(role: str, method: str, path: str) -> bool:
+    # User administration is administrator-only, including GET.
+    if path.startswith("/api/v1/auth/users"):
+        return role == "admin"
+
+    # Users can change their own password.
+    if path == "/api/v1/auth/change-password":
+        return role in {"viewer", "operator", "admin"}
+
+    # Register/device configuration is administrator-only.
+    if (
+        path.startswith("/api/v1/devices")
+        or path.startswith("/api/v1/registers")
+    ):
+        return role == "admin"
+
+    # Command creation is allowed to operators and administrators.
+    if path == "/api/v1/commands" and method == "POST":
+        return role in {"operator", "admin"}
+
+    # Read-only endpoints.
+    if method == "GET":
+        return role in {"viewer", "operator", "admin"}
+
+    return role in {"operator", "admin"}
+
+
+class SecurityMiddleware:
+    """
+    Authentication/authorization middleware.
+
+    Public:
+      - /api/v1/auth/login
+      - /api/v1/health
+
+    Internal SCADA service-token endpoints:
+      - /api/v1/scada/*
+      - /api/v1/commands/pending
+      - /api/v1/commands/{id}/result
+
+    All other /api/v1 endpoints require a JWT.
+    """
+
+    def __init__(self, application):
+        self.application = application
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.application(scope, receive, send)
+            return
+
+        request = Request(scope, receive=receive)
+        path = request.url.path
+        method = request.method.upper()
+
+        # API documentation is disabled for non-local clients.
+        if path in {"/docs", "/redoc", "/openapi.json"}:
+            if not _ip_allowed(_client_ip(request)):
+                response = JSONResponse(
+                    status_code=404,
+                    content={"detail": "Not found."},
+                )
+                await response(scope, receive, send)
+                return
+            await self.application(scope, receive, send)
+            return
+
+        # IP allowlist applies to API traffic.
+        if path.startswith("/api/v1/") and not _ip_allowed(
+            _client_ip(request)
+        ):
+            response = JSONResponse(
+                status_code=403,
+                content={"detail": "Client IP is not allowed."},
+            )
+            await response(scope, receive, send)
+            return
+
+        # Public endpoints.
+        if path in {
+            "/api/v1/auth/login",
+            "/api/v1/health",
+        }:
+            await self.application(scope, receive, send)
+            return
+
+        # Internal SCADA/slave communication uses a separate
+        # long-lived service token, not a human JWT.
+        service_endpoint = (
+            path.startswith("/api/v1/scada/")
+            or path == "/api/v1/commands/pending"
+            or (
+                path.startswith("/api/v1/commands/")
+                and path.endswith("/result")
+            )
+        )
+
+        if service_endpoint:
+            token = _extract_bearer_token(request)
+
+            if (
+                not SCADA_SERVICE_TOKEN
+                or not token
+                or not secrets.compare_digest(
+                    token,
+                    SCADA_SERVICE_TOKEN,
+                )
+            ):
+                response = JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid SCADA service token."},
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+                await response(scope, receive, send)
+                return
+
+            await self.application(scope, receive, send)
+            return
+
+        token = _extract_bearer_token(request)
+
+        if not token:
+            response = JSONResponse(
+                status_code=401,
+                content={"detail": "Authentication required."},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, receive, send)
+            return
+
+        payload = _decode_access_token(token)
+
+        # Verify the user still exists and is active.
+        connection = get_connection()
+        try:
+            user = connection.execute(
+                """
+                SELECT username, role, enabled
+                FROM users
+                WHERE username = ?
+                """,
+                (payload["sub"],),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        if user is None or not user["enabled"]:
+            response = JSONResponse(
+                status_code=401,
+                content={"detail": "User is disabled or does not exist."},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, receive, send)
+            return
+
+        if not _role_allowed(user["role"], method, path):
+            response = JSONResponse(
+                status_code=403,
+                content={"detail": "Insufficient permissions."},
+            )
+            await response(scope, receive, send)
+            return
+
+        # Expose authenticated user to endpoints through request.state.
+        scope.setdefault("state", {})
+        scope["state"]["user"] = {
+            "username": user["username"],
+            "role": user["role"],
+        }
+
+        await self.application(scope, receive, send)
+
 
 SUPPORTED_DATA_TYPES = {
     "BOOL": 1,
@@ -40,12 +374,128 @@ SUPPORTED_ACCESS = {
 app = FastAPI(
     title="ScadaWatt REST API",
     description=(
-        "Dynamic REST API for multi-device Modbus/SCADA "
-        "register configuration, live values, snapshots, "
-        "history and command management."
+        "ScadaWatt REST API.\n\n"
+        "### Kullanıcı girişi\n"
+        "1. `POST /api/v1/auth/login` ile kullanıcı adı ve şifrenizle giriş yapın.\n"
+        "2. Dönen `access_token` değerini Swagger üzerindeki **Authorize** butonuna girin.\n"
+        "3. Yetkinize göre cihaz, register ve komut işlemlerini kullanın.\n\n"
+        "### Yetkilendirme\n"
+        "Normal API kullanımı JWT tabanlı kullanıcı oturumu ile korunur. "
+        "SCADA servislerine ait dahili kimlik doğrulama bilgileri Swagger arayüzünde gösterilmez."
     ),
-    version="6.0.1",
+    version=API_VERSION,
+    swagger_ui_parameters={
+        "persistAuthorization": True,
+        "displayRequestDuration": True,
+        "docExpansion": "list",
+        "filter": True,
+    },
 )
+
+
+# HTTP security middleware.
+if ALLOWED_HOSTS:
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=ALLOWED_HOSTS,
+    )
+
+if CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
+app.add_middleware(SecurityMiddleware)
+
+
+# OpenAPI security definitions for Swagger UI.
+# The runtime authentication is enforced by SecurityMiddleware above;
+# these definitions make the same rules visible and usable in /docs.
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+
+    schema.setdefault("components", {}).setdefault("securitySchemes", {})
+    schema["components"]["securitySchemes"]["BearerAuth"] = {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": (
+            "Human user JWT. Obtain it from POST /api/v1/auth/login "
+            "and enter only the token value here."
+        ),
+    }
+    # Internal SCADA/slave service endpoints are intentionally kept out of
+    # the public Swagger document. They are still available at runtime and
+    # are protected by SCADA_SERVICE_TOKEN in SecurityMiddleware.
+    internal_paths = {
+        path
+        for path in list(schema.get("paths", {}))
+        if (
+            path.startswith("/api/v1/scada/")
+            or path == "/api/v1/commands/pending"
+            or (
+                path.startswith("/api/v1/commands/")
+                and path.endswith("/result")
+            )
+        )
+    }
+    for path in internal_paths:
+        schema["paths"].pop(path, None)
+
+    public_paths = {
+        "/api/v1/auth/login",
+        "/api/v1/health",
+    }
+
+    # Keep the Swagger UI focused on the human-user authentication flow.
+    for path, path_item in schema.get("paths", {}).items():
+        for operation in path_item.values():
+            if not isinstance(operation, dict):
+                continue
+
+            if path in public_paths:
+                operation.pop("security", None)
+            elif path.startswith("/api/v1/"):
+                operation["security"] = [{"BearerAuth": []}]
+
+        if path.startswith("/api/v1/auth/"):
+            for operation in path_item.values():
+                if isinstance(operation, dict):
+                    operation.setdefault("tags", ["🔐 Kimlik Doğrulama"])
+        elif path.startswith("/api/v1/devices"):
+            for operation in path_item.values():
+                if isinstance(operation, dict):
+                    operation.setdefault("tags", ["Cihazlar"])
+        elif path.startswith("/api/v1/registers"):
+            for operation in path_item.values():
+                if isinstance(operation, dict):
+                    operation.setdefault("tags", ["Registerlar"])
+        elif path.startswith("/api/v1/commands"):
+            for operation in path_item.values():
+                if isinstance(operation, dict):
+                    operation.setdefault("tags", ["Komutlar"])
+        elif path.startswith("/api/v1/health"):
+            for operation in path_item.values():
+                if isinstance(operation, dict):
+                    operation.setdefault("tags", ["Sistem"])
+
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
 
 
 # ============================================================
@@ -824,6 +1274,109 @@ def initialize_database() -> None:
             """
         )
 
+
+        # ----------------------------------------------------
+        # Security tables / migrations
+        # ----------------------------------------------------
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'viewer',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK(role IN ('viewer', 'operator', 'admin'))
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT,
+                action TEXT NOT NULL,
+                method TEXT NOT NULL,
+                path TEXT NOT NULL,
+                client_ip TEXT,
+                detail TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        if not column_exists(
+            connection,
+            "commands",
+            "created_by",
+        ):
+            connection.execute(
+                """
+                ALTER TABLE commands
+                ADD COLUMN created_by TEXT
+                """
+            )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at
+            ON audit_logs(created_at)
+            """
+        )
+
+        # Create the initial administrator only once.
+        admin_exists = connection.execute(
+            """
+            SELECT id
+            FROM users
+            WHERE username = ?
+            """,
+            (ADMIN_USERNAME,),
+        ).fetchone()
+
+        if admin_exists is None:
+            initial_password = (
+                ADMIN_PASSWORD
+                or secrets.token_urlsafe(18)
+            )
+
+            connection.execute(
+                """
+                INSERT INTO users (
+                    username,
+                    password_hash,
+                    role,
+                    enabled,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, 'admin', 1, ?, ?)
+                """,
+                (
+                    ADMIN_USERNAME,
+                    pwd_hasher.hash(initial_password),
+                    utc_now(),
+                    utc_now(),
+                ),
+            )
+
+            if ADMIN_PASSWORD:
+                print(
+                    f"Initial admin user created: {ADMIN_USERNAME}"
+                )
+            else:
+                print(
+                    "WARNING: ADMIN_PASSWORD was not set."
+                )
+                print(
+                    "Initial admin password (save it and change it): "
+                    f"{initial_password}"
+                )
+
         # ----------------------------------------------------
         # Default device
         # ----------------------------------------------------
@@ -1049,7 +1602,95 @@ def seed_registers(
         )
 
 
+
 initialize_database()
+
+
+# ============================================================
+# COMMAND-LINE ADMIN PASSWORD RESET
+# ============================================================
+
+def reset_admin_password_cli() -> int:
+    """Reset the configured admin user's password without deleting data."""
+    username = ADMIN_USERNAME.strip()
+
+    if not username:
+        print("ERROR: ADMIN_USERNAME is empty.")
+        return 1
+
+    print()
+    print("=== ScadaWatt Admin Password Reset ===")
+    print(f"Admin username: {username}")
+    print("This changes only the user's password.")
+    print("SCADA devices, registers, values and history are not deleted.")
+    print()
+
+    while True:
+        new_password = getpass.getpass("New password (minimum 8 characters): ")
+        confirm_password = getpass.getpass("Confirm new password: ")
+
+        if len(new_password) < 8:
+            print("ERROR: Password must be at least 8 characters.")
+            print()
+            continue
+
+        if new_password != confirm_password:
+            print("ERROR: Passwords do not match.")
+            print()
+            continue
+
+        break
+
+    connection = get_connection()
+    try:
+        user = connection.execute(
+            """
+            SELECT id, username, role
+            FROM users
+            WHERE username = ?
+            """,
+            (username,),
+        ).fetchone()
+
+        if user is None:
+            print(f"ERROR: Admin user '{username}' was not found.")
+            print("Check ADMIN_USERNAME or create the admin user first.")
+            return 1
+
+        if user["role"] != "admin":
+            print(
+                f"ERROR: User '{username}' exists but its role is "
+                f"'{user['role']}', not 'admin'."
+            )
+            return 1
+
+        connection.execute(
+            """
+            UPDATE users
+            SET password_hash = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                pwd_hasher.hash(new_password),
+                utc_now(),
+                user["id"],
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    print()
+    print(f"SUCCESS: Password changed for admin user '{username}'.")
+    print("You can now log in from Swagger:")
+    print("http://127.0.0.1:8000/docs")
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] == "--reset-admin-password":
+        raise SystemExit(reset_admin_password_cli())
 
 
 class DeviceCreate(BaseModel):
@@ -1171,11 +1812,313 @@ class ScadaHeartbeat(BaseModel):
     error: str | None = None
 
 
+
+# ============================================================
+# AUTHENTICATION / USER MANAGEMENT
+# ============================================================
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=200)
+
+
+class CreateUserRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=100)
+    password: str = Field(min_length=12, max_length=200)
+    role: str = Field(default="viewer")
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=200)
+    new_password: str = Field(min_length=12, max_length=200)
+
+
+def _get_authenticated_user_from_request(
+    request: Request,
+) -> dict:
+    user = getattr(request.state, "user", None)
+
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required.",
+        )
+
+    return user
+
+
+def _audit(
+    username: str | None,
+    action: str,
+    method: str,
+    path: str,
+    client_ip: str | None,
+    detail: str | None = None,
+) -> None:
+    connection = get_connection()
+    try:
+        connection.execute(
+            """
+            INSERT INTO audit_logs (
+                username,
+                action,
+                method,
+                path,
+                client_ip,
+                detail,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                username,
+                action,
+                method,
+                path,
+                client_ip,
+                detail,
+                utc_now(),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+@app.post("/api/v1/auth/login")
+def login(payload: LoginRequest, request: Request):
+    client_ip = _client_ip(request)
+
+    if _login_rate_limited(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many login attempts. Try again later.",
+        )
+
+    connection = get_connection()
+    try:
+        user = connection.execute(
+            """
+            SELECT username, password_hash, role, enabled
+            FROM users
+            WHERE username = ?
+            """,
+            (payload.username.strip(),),
+        ).fetchone()
+    finally:
+        connection.close()
+
+    if (
+        user is None
+        or not user["enabled"]
+        or not pwd_hasher.verify(
+            payload.password,
+            user["password_hash"],
+        )
+    ):
+        _audit(
+            payload.username.strip(),
+            "login_failed",
+            "POST",
+            "/api/v1/auth/login",
+            client_ip,
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = _create_access_token(
+        user["username"],
+        user["role"],
+    )
+
+    _audit(
+        user["username"],
+        "login_success",
+        "POST",
+        "/api/v1/auth/login",
+        client_ip,
+    )
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "user": {
+            "username": user["username"],
+            "role": user["role"],
+        },
+    }
+
+
+@app.get("/api/v1/auth/me")
+def me(request: Request):
+    return _get_authenticated_user_from_request(request)
+
+
+@app.post("/api/v1/auth/change-password")
+def change_password(
+    payload: ChangePasswordRequest,
+    request: Request,
+):
+    current_user = _get_authenticated_user_from_request(request)
+
+    if payload.current_password == payload.new_password:
+        raise HTTPException(
+            status_code=400,
+            detail="New password must be different.",
+        )
+
+    connection = get_connection()
+    try:
+        user = connection.execute(
+            """
+            SELECT id, password_hash
+            FROM users
+            WHERE username = ?
+            """,
+            (current_user["username"],),
+        ).fetchone()
+
+        if user is None:
+            raise HTTPException(
+                status_code=404,
+                detail="User not found.",
+            )
+
+        if not pwd_hasher.verify(
+            payload.current_password,
+            user["password_hash"],
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="Current password is incorrect.",
+            )
+
+        connection.execute(
+            """
+            UPDATE users
+            SET password_hash = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                pwd_hasher.hash(payload.new_password),
+                utc_now(),
+                user["id"],
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    _audit(
+        current_user["username"],
+        "password_changed",
+        "POST",
+        "/api/v1/auth/change-password",
+        _client_ip(request),
+    )
+
+    return {"success": True}
+
+
+@app.get("/api/v1/auth/users")
+def list_users(request: Request):
+    _get_authenticated_user_from_request(request)
+
+    connection = get_connection()
+    try:
+        rows = connection.execute(
+            """
+            SELECT id, username, role, enabled, created_at, updated_at
+            FROM users
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        return {
+            "count": len(rows),
+            "users": [dict(row) for row in rows],
+        }
+    finally:
+        connection.close()
+
+
+@app.post("/api/v1/auth/users", status_code=201)
+def create_user(
+    payload: CreateUserRequest,
+    request: Request,
+):
+    current_user = _get_authenticated_user_from_request(request)
+
+    if payload.role not in {"viewer", "operator", "admin"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Role must be viewer, operator or admin.",
+        )
+
+    username = payload.username.strip()
+
+    if not username:
+        raise HTTPException(
+            status_code=400,
+            detail="Username cannot be empty.",
+        )
+
+    connection = get_connection()
+    try:
+        try:
+            connection.execute(
+                """
+                INSERT INTO users (
+                    username,
+                    password_hash,
+                    role,
+                    enabled,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    username,
+                    pwd_hasher.hash(payload.password),
+                    payload.role,
+                    utc_now(),
+                    utc_now(),
+                ),
+            )
+            connection.commit()
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Username already exists.",
+            ) from exc
+    finally:
+        connection.close()
+
+    _audit(
+        current_user["username"],
+        "user_created",
+        "POST",
+        "/api/v1/auth/users",
+        _client_ip(request),
+        f"created={username}, role={payload.role}",
+    )
+
+    return {
+        "success": True,
+        "username": username,
+        "role": payload.role,
+    }
+
+
 @app.get("/Emirhan")
 def root():
     return {
         "application": "ScadaWatt REST API",
-        "version": "6.0.1",
+        "version": API_VERSION,
         "status": "online",
         "architecture": "multi-device",
         "database": str(DATABASE_PATH),
@@ -2442,7 +3385,7 @@ def get_snapshots(
     "/api/v1/commands",
     status_code=201,
 )
-def create_command(command: CommandCreate):
+def create_command(command: CommandCreate, request: Request):
     connection = get_connection()
 
     try:
@@ -2479,6 +3422,16 @@ def create_command(command: CommandCreate):
             )
 
         timestamp = utc_now()
+        authenticated_user = getattr(
+            request.state,
+            "user",
+            None,
+        )
+        created_by = (
+            authenticated_user["username"]
+            if authenticated_user
+            else None
+        )
 
         cursor = connection.execute(
             """
@@ -2486,9 +3439,10 @@ def create_command(command: CommandCreate):
                 register_id,
                 value_json,
                 status,
-                created_at
+                created_at,
+                created_by
             )
-            VALUES (?, ?, 'pending', ?)
+            VALUES (?, ?, 'pending', ?, ?)
             """,
             (
                 command.register_id,
@@ -2497,6 +3451,7 @@ def create_command(command: CommandCreate):
                     ensure_ascii=False,
                 ),
                 timestamp,
+                created_by,
             ),
         )
 
@@ -2521,7 +3476,8 @@ def create_command(command: CommandCreate):
                 c.status,
                 c.error,
                 c.created_at,
-                c.processed_at
+                c.processed_at,
+                c.created_by
             FROM commands c
             INNER JOIN registers r
                 ON r.id = c.register_id
@@ -2578,7 +3534,8 @@ def get_pending_commands():
                 c.status,
                 c.error,
                 c.created_at,
-                c.processed_at
+                c.processed_at,
+                c.created_by
             FROM commands c
             INNER JOIN registers r
                 ON r.id = c.register_id
@@ -2611,6 +3568,7 @@ def get_pending_commands():
                     "error": row["error"],
                     "created_at": row["created_at"],
                     "processed_at": row["processed_at"],
+                    "created_by": row["created_by"],
                 }
             )
 
@@ -2720,7 +3678,8 @@ def get_commands(
                 c.status,
                 c.error,
                 c.created_at,
-                c.processed_at
+                c.processed_at,
+                c.created_by
             FROM commands c
             INNER JOIN registers r
                 ON r.id = c.register_id
@@ -2773,6 +3732,7 @@ def get_commands(
                     "error": row["error"],
                     "created_at": row["created_at"],
                     "processed_at": row["processed_at"],
+                    "created_by": row["created_by"],
                 }
             )
 
@@ -2976,7 +3936,7 @@ def get_status():
         return {
             "api": {
                 "status": "online",
-                "version": "6.0.0",
+                "version": API_VERSION,
             },
             "database": {
                 "status": "connected",
@@ -3143,7 +4103,7 @@ def database_info():
 def api_info():
     return {
         "application": "ScadaWatt",
-        "api_version": "6.0.0",
+        "api_version": API_VERSION,
         "architecture": {
             "api": "FastAPI",
             "database": "SQLite",
@@ -3184,5 +4144,16 @@ def api_info():
             "status": "/api/v1/status",
             "health": "/api/v1/health",
             "database": "/api/v1/database",
+            "login": "/api/v1/auth/login",
+            "me": "/api/v1/auth/me",
+            "change_password": "/api/v1/auth/change-password",
+            "users": "/api/v1/auth/users",
+        },
+        "security": {
+            "authentication": "JWT Bearer",
+            "roles": ["viewer", "operator", "admin"],
+            "scada_authentication": "Bearer service token",
+            "ip_allowlist": True,
+            "https_required_in_production": True,
         },
     }
