@@ -44,7 +44,7 @@ app = FastAPI(
         "register configuration, live values, snapshots, "
         "history and command management."
     ),
-    version="6.0.0",
+    version="6.0.1",
 )
 
 
@@ -1179,11 +1179,11 @@ class ScadaHeartbeat(BaseModel):
 # ROOT
 # ============================================================
 
-@app.get("/")
+@app.get("/Emirhan")
 def root():
     return {
         "application": "ScadaWatt REST API",
-        "version": "6.0.0",
+        "version": "6.0.1",
         "status": "online",
         "architecture": "multi-device",
         "database": str(DATABASE_PATH),
@@ -1202,7 +1202,7 @@ def get_devices(
         description="Return only enabled devices.",
     ),
 ):
-    connection = get_connection()
+    connection = get_connection()                                   
 
     try:
         if enabled_only:
@@ -1213,7 +1213,7 @@ def get_devices(
                 WHERE enabled = 1
                 ORDER BY id ASC
                 """
-            ).fetchall()
+            ).fetchall()                                            
         else:
             rows = connection.execute(
                 """
@@ -1268,7 +1268,7 @@ def get_device(device_id: int):
         if row is None:
             raise HTTPException(
                 status_code=404,
-                detail="Device not found.",
+                detail="Cihaz bulunamadı emirhan kurcalama.",
             )
 
         device = serialize_device(row)
@@ -1289,10 +1289,7 @@ def get_device(device_id: int):
         connection.close()
 
 
-@app.post(
-    "/api/v1/devices",
-    status_code=201,
-)
+@app.post("/api/v1/devices", status_code=201,)
 def create_device(device: DeviceCreate):
     connection = get_connection()
 
@@ -1481,6 +1478,41 @@ def update_device(
     finally:
         connection.close()
 
+
+@app.get("/api/v1/Emirhan/navdar/{device_id}")
+def showDevices(device_id: int):
+    connection = get_connection()
+
+    try:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM devices
+            WHERE id = ?
+            """,
+            (device_id,),
+        ).fetchone()
+
+        if row is None:
+            raise HTTPException(
+                status_code = 404,
+                detail="Cihaz bulunamadı emirhan kurcalama.",
+            )
+        device = serialize_device(row)
+
+        device["register_count"] = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM registers
+            WHERE device_id = ?
+            AND enabled = 1
+            """,
+            (device_id,),
+        ).fetchone()[0]
+
+        return device
+    finally:
+        connection.close()
 
 @app.delete("/api/v1/devices/{device_id}")
 def delete_device(device_id: int):
